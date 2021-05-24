@@ -29,13 +29,13 @@ impl DMA {
     }
 
     /// Page frame number
-    pub fn pfn(&self) -> u32 {
-        self.paddr >> 12
+    pub fn pfn<PS: PageSize>(&self) -> u32 {
+        self.paddr >> PS::PAGE_SIZE_SHIFT
     }
 
     /// Convert to a buffer
-    pub unsafe fn as_buf(&self) -> &'static mut [u8] {
-        core::slice::from_raw_parts_mut(self.vaddr() as _, PAGE_SIZE * self.pages as usize)
+    pub unsafe fn as_buf<PS: PageSize>(&self) -> &'static mut [u8] {
+        core::slice::from_raw_parts_mut(self.vaddr() as _, PS::page_size() * self.pages as usize)
     }
 }
 

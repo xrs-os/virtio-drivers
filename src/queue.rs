@@ -12,7 +12,7 @@ use volatile::Volatile;
 ///
 /// Each device can have zero or more virtqueues.
 #[repr(C)]
-pub struct VirtQueue<'a> {
+pub struct VirtQueue<'a, const QUEUE_SIZE: u16> {
     /// DMA guard
     dma: DMA,
     /// Descriptor table
@@ -24,8 +24,6 @@ pub struct VirtQueue<'a> {
 
     /// The index of queue
     queue_idx: u32,
-    /// The size of queue
-    queue_size: u16,
     /// The number of used queues.
     num_used: u16,
     /// The head desc index of the free list.
@@ -34,28 +32,34 @@ pub struct VirtQueue<'a> {
     last_used_idx: u16,
 }
 
-impl VirtQueue<'_> {
+impl<const QUEUE_SIZE: u16> VirtQueue<'_, QUEUE_SIZE> {
     /// Create a new VirtQueue.
-    pub fn new(header: &mut VirtIOHeader, idx: usize, size: u16) -> Result<Self> {
+    pub fn new<PS: PageSize>(header: &mut VirtIOHeader, idx: usize) -> Result<Self> {
         if header.queue_used(idx as u32) {
             return Err(Error::AlreadyUsed);
         }
-        if !size.is_power_of_two() || header.max_queue_size() < size as u32 {
+        if !QUEUE_SIZE.is_power_of_two() || header.max_queue_size() < QUEUE_SIZE as u32 {
             return Err(Error::InvalidParam);
         }
-        let layout = VirtQueueLayout::new(size);
+        let layout = VirtQueueLayout::new(QUEUE_SIZE);
         // alloc continuous pages
-        let dma = DMA::new(layout.size / PAGE_SIZE)?;
+        let dma = DMA::new(layout.size / PS::page_size())?;
 
-        header.queue_set(idx as u32, size as u32, PAGE_SIZE as u32, dma.pfn());
+        header.queue_set(
+            idx as u32,
+            QUEUE_SIZE as u32,
+            PS::page_size() as u32,
+            dma.pfn::<PS>(),
+        );
 
-        let desc =
-            unsafe { slice::from_raw_parts_mut(dma.vaddr() as *mut Descriptor, size as usize) };
+        let desc = unsafe {
+            slice::from_raw_parts_mut(dma.vaddr() as *mut Descriptor, QUEUE_SIZE as usize)
+        };
         let avail = unsafe { &mut *((dma.vaddr() + layout.avail_offset) as *mut AvailRing) };
         let used = unsafe { &mut *((dma.vaddr() + layout.used_offset) as *mut UsedRing) };
 
         // link descriptors together
-        for i in 0..(size - 1) {
+        for i in 0..(QUEUE_SIZE - 1) {
             desc[i as usize].next.write(i + 1);
         }
 
@@ -64,7 +68,6 @@ impl VirtQueue<'_> {
             desc,
             avail,
             used,
-            queue_size: size,
             queue_idx: idx as u32,
             num_used: 0,
             free_head: 0,
@@ -80,7 +83,7 @@ impl VirtQueue<'_> {
         if inputs.is_empty() && outputs.is_empty() {
             return Err(Error::InvalidParam);
         }
-        if inputs.len() + outputs.len() + self.num_used as usize > self.queue_size as usize {
+        if inputs.len() + outputs.len() + self.num_used as usize > QUEUE_SIZE as usize {
             return Err(Error::BufferTooSmall);
         }
 
@@ -110,7 +113,7 @@ impl VirtQueue<'_> {
         }
         self.num_used += (inputs.len() + outputs.len()) as u16;
 
-        let avail_slot = self.avail_idx & (self.queue_size - 1);
+        let avail_slot = self.avail_idx & (QUEUE_SIZE - 1);
         self.avail.ring[avail_slot as usize].write(head);
 
         // write barrier
@@ -129,7 +132,7 @@ impl VirtQueue<'_> {
 
     /// The number of free descriptors.
     pub fn available_desc(&self) -> usize {
-        (self.queue_size - self.num_used) as usize
+        (QUEUE_SIZE - self.num_used) as usize
     }
 
     /// Recycle descriptors in the list specified by head.
@@ -161,7 +164,7 @@ impl VirtQueue<'_> {
         // read barrier
         fence(Ordering::SeqCst);
 
-        let last_used_slot = self.last_used_idx & (self.queue_size - 1);
+        let last_used_slot = self.last_used_idx & (QUEUE_SIZE - 1);
         let index = self.used.ring[last_used_slot as usize].id.read() as u16;
         let len = self.used.ring[last_used_slot as usize].len.read();
 
@@ -182,19 +185,15 @@ struct VirtQueueLayout {
 }
 
 impl VirtQueueLayout {
-    fn new(queue_size: u16) -> Self {
-        assert!(
-            queue_size.is_power_of_two(),
-            "queue size should be a power of 2"
-        );
+    const fn new(queue_size: u16) -> Self {
         let queue_size = queue_size as usize;
         let desc = size_of::<Descriptor>() * queue_size;
         let avail = size_of::<u16>() * (3 + queue_size);
         let used = size_of::<u16>() * 3 + size_of::<UsedElem>() * queue_size;
         VirtQueueLayout {
             avail_offset: desc,
-            used_offset: align_up(desc + avail),
-            size: align_up(desc + avail) + align_up(used),
+            used_offset: align_up(desc + avail, 1 << queue_size),
+            size: align_up(desc + avail, 1 << queue_size) + align_up(used, 1 << queue_size),
         }
     }
 }

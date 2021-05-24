@@ -18,9 +18,9 @@ pub struct VirtIOGpu<'a> {
     /// DMA area of frame buffer.
     frame_buffer_dma: Option<DMA>,
     /// Queue for sending control commands.
-    control_queue: VirtQueue<'a>,
+    control_queue: VirtQueue<'a, 2>,
     /// Queue for sending cursor commands.
-    cursor_queue: VirtQueue<'a>,
+    cursor_queue: VirtQueue<'a, 2>,
     /// Queue buffer DMA
     queue_buf_dma: DMA,
     /// Send buffer for queue.
@@ -31,8 +31,8 @@ pub struct VirtIOGpu<'a> {
 
 impl VirtIOGpu<'_> {
     /// Create a new VirtIO-Gpu driver.
-    pub fn new(header: &'static mut VirtIOHeader) -> Result<Self> {
-        header.begin_init(|features| {
+    pub fn new<PS: PageSize>(header: &'static mut VirtIOHeader) -> Result<Self> {
+        header.begin_init::<PS, _>(|features| {
             let features = Features::from_bits_truncate(features);
             info!("Device features {:?}", features);
             let supported_features = Features::empty();
@@ -43,12 +43,12 @@ impl VirtIOGpu<'_> {
         let config = unsafe { &mut *(header.config_space() as *mut Config) };
         info!("Config: {:?}", config);
 
-        let control_queue = VirtQueue::new(header, QUEUE_TRANSMIT, 2)?;
-        let cursor_queue = VirtQueue::new(header, QUEUE_CURSOR, 2)?;
+        let control_queue = VirtQueue::new::<PS>(header, QUEUE_TRANSMIT)?;
+        let cursor_queue = VirtQueue::new::<PS>(header, QUEUE_CURSOR)?;
 
         let queue_buf_dma = DMA::new(2)?;
-        let queue_buf_send = unsafe { &mut queue_buf_dma.as_buf()[..PAGE_SIZE] };
-        let queue_buf_recv = unsafe { &mut queue_buf_dma.as_buf()[PAGE_SIZE..] };
+        let queue_buf_send = unsafe { &mut queue_buf_dma.as_buf::<PS>()[..PS::page_size()] };
+        let queue_buf_recv = unsafe { &mut queue_buf_dma.as_buf::<PS>()[PS::page_size()..] };
 
         header.finish_init();
 
@@ -75,7 +75,7 @@ impl VirtIOGpu<'_> {
     }
 
     /// Setup framebuffer
-    pub fn setup_framebuffer(&mut self) -> Result<&mut [u8]> {
+    pub fn setup_framebuffer<PS: PageSize>(&mut self) -> Result<&mut [u8]> {
         // get display info
         let display_info: RespDisplayInfo =
             self.request(CtrlHeader::with_type(Command::GetDisplayInfo))?;
@@ -95,7 +95,7 @@ impl VirtIOGpu<'_> {
 
         // alloc continuous pages for the frame buffer
         let size = display_info.rect.width * display_info.rect.height * 4;
-        let frame_buffer_dma = DMA::new(pages(size as usize))?;
+        let frame_buffer_dma = DMA::new(pages(size as usize, PS::page_size()))?;
 
         // resource_attach_backing
         let rsp: CtrlHeader = self.request(ResourceAttachBacking {
@@ -117,7 +117,7 @@ impl VirtIOGpu<'_> {
         })?;
         rsp.check_type(Command::OkNodata)?;
 
-        let buf = unsafe { frame_buffer_dma.as_buf() };
+        let buf = unsafe { frame_buffer_dma.as_buf::<PS>() };
         self.frame_buffer_dma = Some(frame_buffer_dma);
         Ok(buf)
     }

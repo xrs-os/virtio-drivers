@@ -10,8 +10,8 @@ use volatile::Volatile;
 /// making pass-through implementations on top of evdev easy.
 pub struct VirtIOInput<'a> {
     header: &'static mut VirtIOHeader,
-    event_queue: VirtQueue<'a>,
-    status_queue: VirtQueue<'a>,
+    event_queue: VirtQueue<'a, QUEUE_SIZE>,
+    status_queue: VirtQueue<'a, QUEUE_SIZE>,
     event_buf: &'a mut [Event],
     x: i32,
     y: i32,
@@ -19,12 +19,15 @@ pub struct VirtIOInput<'a> {
 
 impl<'a> VirtIOInput<'a> {
     /// Create a new VirtIO-Input driver.
-    pub fn new(header: &'static mut VirtIOHeader, event_buf: &'a mut [u64]) -> Result<Self> {
-        if event_buf.len() < QUEUE_SIZE {
+    pub fn new<PS: PageSize>(
+        header: &'static mut VirtIOHeader,
+        event_buf: &'a mut [u64],
+    ) -> Result<Self> {
+        if event_buf.len() < QUEUE_SIZE as usize {
             return Err(Error::BufferTooSmall);
         }
         let event_buf: &mut [Event] = unsafe { core::mem::transmute(event_buf) };
-        header.begin_init(|features| {
+        header.begin_init::<PS, _>(|features| {
             let features = Feature::from_bits_truncate(features);
             info!("Device features: {:?}", features);
             // negotiate these flags only
@@ -36,8 +39,8 @@ impl<'a> VirtIOInput<'a> {
         let config = unsafe { &mut *(header.config_space() as *mut Config) };
         info!("Config: {:?}", config);
 
-        let mut event_queue = VirtQueue::new(header, QUEUE_EVENT, QUEUE_SIZE as u16)?;
-        let status_queue = VirtQueue::new(header, QUEUE_STATUS, QUEUE_SIZE as u16)?;
+        let mut event_queue = VirtQueue::new::<PS>(header, QUEUE_EVENT)?;
+        let status_queue = VirtQueue::new::<PS>(header, QUEUE_STATUS)?;
         for (i, event) in event_buf.iter_mut().enumerate() {
             let token = event_queue.add(&[], &[event.as_buf_mut()])?;
             assert_eq!(token, i as u16);
@@ -183,4 +186,4 @@ const QUEUE_EVENT: usize = 0;
 const QUEUE_STATUS: usize = 1;
 
 // a parameter that can change
-const QUEUE_SIZE: usize = 32;
+const QUEUE_SIZE: u16 = 32;

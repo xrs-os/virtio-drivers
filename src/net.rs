@@ -16,14 +16,14 @@ use volatile::{ReadOnly, Volatile};
 pub struct VirtIONet<'a> {
     header: &'static mut VirtIOHeader,
     mac: EthernetAddress,
-    recv_queue: VirtQueue<'a>,
-    send_queue: VirtQueue<'a>,
+    recv_queue: VirtQueue<'a, 2>,
+    send_queue: VirtQueue<'a, 2>,
 }
 
 impl VirtIONet<'_> {
     /// Create a new VirtIO-Net driver.
-    pub fn new(header: &'static mut VirtIOHeader) -> Result<Self> {
-        header.begin_init(|features| {
+    pub fn new<PS: PageSize>(header: &'static mut VirtIOHeader) -> Result<Self> {
+        header.begin_init::<PS, _>(|features| {
             let features = Features::from_bits_truncate(features);
             info!("Device features {:?}", features);
             let supported_features = Features::MAC | Features::STATUS;
@@ -34,9 +34,8 @@ impl VirtIONet<'_> {
         let mac = config.mac.read();
         debug!("Got MAC={:?}, status={:?}", mac, config.status.read());
 
-        let queue_num = 2; // for simplicity
-        let recv_queue = VirtQueue::new(header, QUEUE_RECEIVE, queue_num)?;
-        let send_queue = VirtQueue::new(header, QUEUE_TRANSMIT, queue_num)?;
+        let recv_queue = VirtQueue::new::<PS>(header, QUEUE_RECEIVE)?;
+        let send_queue = VirtQueue::new::<PS>(header, QUEUE_TRANSMIT)?;
 
         header.finish_init();
 

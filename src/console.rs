@@ -12,8 +12,8 @@ const QUEUE_TRANSMITQ_PORT_0: usize = 1;
 /// Emergency and cols/rows unimplemented.
 pub struct VirtIOConsole<'a> {
     header: &'static mut VirtIOHeader,
-    receiveq: VirtQueue<'a>,
-    transmitq: VirtQueue<'a>,
+    receiveq: VirtQueue<'a, 2>,
+    transmitq: VirtQueue<'a, 2>,
     queue_buf_dma: DMA,
     queue_buf_rx: &'a mut [u8],
     cursor: usize,
@@ -22,8 +22,8 @@ pub struct VirtIOConsole<'a> {
 
 impl<'a> VirtIOConsole<'a> {
     /// Create a new VirtIO-Console driver.
-    pub fn new(header: &'static mut VirtIOHeader) -> Result<Self> {
-        header.begin_init(|features| {
+    pub fn new<PS: PageSize>(header: &'static mut VirtIOHeader) -> Result<Self> {
+        header.begin_init::<PS, _>(|features| {
             let features = Features::from_bits_truncate(features);
             info!("Device features {:?}", features);
             let supported_features = Features::empty();
@@ -31,10 +31,10 @@ impl<'a> VirtIOConsole<'a> {
         });
         let config = unsafe { &mut *(header.config_space() as *mut Config) };
         info!("Config: {:?}", config);
-        let receiveq = VirtQueue::new(header, QUEUE_RECEIVEQ_PORT_0, 2)?;
-        let transmitq = VirtQueue::new(header, QUEUE_TRANSMITQ_PORT_0, 2)?;
+        let receiveq = VirtQueue::new::<PS>(header, QUEUE_RECEIVEQ_PORT_0)?;
+        let transmitq = VirtQueue::new::<PS>(header, QUEUE_TRANSMITQ_PORT_0)?;
         let queue_buf_dma = DMA::new(1)?;
-        let queue_buf_rx = unsafe { &mut queue_buf_dma.as_buf()[0..] };
+        let queue_buf_rx = unsafe { &mut queue_buf_dma.as_buf::<PS>()[0..] };
         header.finish_init();
         let mut console = VirtIOConsole {
             header,

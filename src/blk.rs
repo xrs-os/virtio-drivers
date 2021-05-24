@@ -12,14 +12,14 @@ use volatile::Volatile;
 /// and serviced (probably out of order) by the device except where noted.
 pub struct VirtIOBlk<'a> {
     header: &'static mut VirtIOHeader,
-    queue: VirtQueue<'a>,
+    queue: VirtQueue<'a, 16>,
     capacity: usize,
 }
 
 impl VirtIOBlk<'_> {
     /// Create a new VirtIO-Blk driver.
-    pub fn new(header: &'static mut VirtIOHeader) -> Result<Self> {
-        header.begin_init(|features| {
+    pub fn new<PS: PageSize>(header: &'static mut VirtIOHeader) -> Result<Self> {
+        header.begin_init::<PS, _>(|features| {
             let features = BlkFeature::from_bits_truncate(features);
             info!("device features: {:?}", features);
             // negotiate these flags only
@@ -35,7 +35,7 @@ impl VirtIOBlk<'_> {
             config.capacity.read() / 2
         );
 
-        let queue = VirtQueue::new(header, 0, 16)?;
+        let queue = VirtQueue::new::<PS>(header, 0)?;
         header.finish_init();
 
         Ok(VirtIOBlk {

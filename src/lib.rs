@@ -27,8 +27,6 @@ use self::queue::VirtQueue;
 use core::mem::size_of;
 use hal::*;
 
-const PAGE_SIZE: usize = 0x1000;
-
 /// The type returned by driver methods.
 pub type Result<T = ()> = core::result::Result<T, Error>;
 
@@ -55,13 +53,24 @@ pub enum Error {
 }
 
 /// Align `size` up to a page.
-fn align_up(size: usize) -> usize {
-    (size + PAGE_SIZE) & !(PAGE_SIZE - 1)
+const fn align_up(size: usize, page_size: usize) -> usize {
+    (size + page_size) & !(page_size - 1)
 }
 
 /// Pages of `size`.
-fn pages(size: usize) -> usize {
-    (size + PAGE_SIZE - 1) / PAGE_SIZE
+const fn pages(size: usize, page_size: usize) -> usize {
+    (size + page_size - 1) / page_size
+}
+
+/// Page size
+pub trait PageSize {
+    /// Page size is equal to 1 << PAGE_SIZE_SHIFT
+    const PAGE_SIZE_SHIFT: u8;
+
+    /// Return calculated page size
+    fn page_size() -> usize {
+        1 << Self::PAGE_SIZE_SHIFT
+    }
 }
 
 /// Convert a struct into buffer.

@@ -1,6 +1,7 @@
-use crate::PAGE_SIZE;
 use bitflags::*;
 use volatile::{ReadOnly, Volatile, WriteOnly};
+
+use crate::PageSize;
 
 /// MMIO Device Legacy Register Interface.
 ///
@@ -168,7 +169,7 @@ impl VirtIOHeader {
     /// Begin initializing the device.
     ///
     /// Ref: virtio 3.1.1 Device Initialization
-    pub fn begin_init(&mut self, negotiate_features: impl FnOnce(u64) -> u64) {
+    pub fn begin_init<PS: PageSize, F: FnOnce(u64) -> u64>(&mut self, negotiate_features: F) {
         self.status.write(DeviceStatus::ACKNOWLEDGE);
         self.status.write(DeviceStatus::DRIVER);
 
@@ -176,7 +177,7 @@ impl VirtIOHeader {
         self.write_driver_features(negotiate_features(features));
         self.status.write(DeviceStatus::FEATURES_OK);
 
-        self.guest_page_size.write(PAGE_SIZE as u32);
+        self.guest_page_size.write(PS::page_size() as u32);
     }
 
     /// Finish initializing the device.
