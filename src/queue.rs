@@ -1,6 +1,11 @@
+use alloc::{sync::Arc, vec::Vec};
+use core::future::Future;
 use core::mem::size_of;
+use core::pin::Pin;
+use core::ptr::NonNull;
 use core::slice;
 use core::sync::atomic::{fence, Ordering};
+use core::task::{Context, Poll, Waker};
 
 use super::*;
 use crate::header::VirtIOHeader;
@@ -12,27 +17,15 @@ use volatile::Volatile;
 ///
 /// Each device can have zero or more virtqueues.
 #[repr(C)]
-pub struct VirtQueue<'a, const QUEUE_SIZE: u16> {
+pub struct VirtQueue<'a, const QUEUE_SIZE: usize> {
     /// DMA guard
     dma: DMA,
-    /// Descriptor table
-    desc: &'a mut [Descriptor],
-    /// Available ring
-    avail: &'a mut AvailRing,
-    /// Used ring
-    used: &'a mut UsedRing,
-
     /// The index of queue
     queue_idx: u32,
-    /// The number of used queues.
-    num_used: u16,
-    /// The head desc index of the free list.
-    free_head: u16,
-    avail_idx: u16,
-    last_used_idx: u16,
+    inner: Arc<spin::Mutex<VirtQueueInner<'a>>>,
 }
 
-impl<const QUEUE_SIZE: u16> VirtQueue<'_, QUEUE_SIZE> {
+impl<'a, const QUEUE_SIZE: usize> VirtQueue<'a, QUEUE_SIZE> {
     /// Create a new VirtQueue.
     pub fn new<PS: PageSize>(header: &mut VirtIOHeader, idx: usize) -> Result<Self> {
         if header.queue_used(idx as u32) {
@@ -52,38 +45,165 @@ impl<const QUEUE_SIZE: u16> VirtQueue<'_, QUEUE_SIZE> {
             dma.pfn::<PS>(),
         );
 
-        let desc = unsafe {
-            slice::from_raw_parts_mut(dma.vaddr() as *mut Descriptor, QUEUE_SIZE as usize)
-        };
+        let desc = unsafe { slice::from_raw_parts_mut(dma.vaddr() as *mut Descriptor, QUEUE_SIZE) };
         let avail = unsafe { &mut *((dma.vaddr() + layout.avail_offset) as *mut AvailRing) };
         let used = unsafe { &mut *((dma.vaddr() + layout.used_offset) as *mut UsedRing) };
 
         // link descriptors together
         for i in 0..(QUEUE_SIZE - 1) {
-            desc[i as usize].next.write(i + 1);
+            desc[i as usize].next.write(i as u16 + 1);
         }
 
         Ok(VirtQueue {
             dma,
-            desc,
-            avail,
-            used,
             queue_idx: idx as u32,
-            num_used: 0,
-            free_head: 0,
-            avail_idx: 0,
-            last_used_idx: 0,
+            inner: Arc::new(spin::Mutex::new(VirtQueueInner {
+                desc,
+                avail,
+                used,
+                num_used: 0,
+                free_head: 0,
+                avail_idx: 0,
+                last_used_idx: 0,
+                wakers: vec![None; QUEUE_SIZE],
+            })),
         })
     }
 
     /// Add buffers to the virtqueue, return a token.
     ///
     /// Ref: linux virtio_ring.c virtqueue_add
-    pub fn add(&mut self, inputs: &[&[u8]], outputs: &[&mut [u8]]) -> Result<u16> {
+    pub fn add(&self, inputs: &[&[u8]], outputs: &[&mut [u8]]) -> Result<u16> {
+        self.inner.lock().add::<QUEUE_SIZE>(inputs, outputs)
+    }
+
+    pub fn async_add(
+        &self,
+        header: NonNull<VirtIOHeader>,
+        inputs: &[&[u8]],
+        outputs: &[&mut [u8]],
+    ) -> Result<VirtFuture<'a, QUEUE_SIZE>> {
+        let desc_idx = self.add(inputs, outputs)?;
+        Ok(VirtFuture::<'a, QUEUE_SIZE>::new(
+            desc_idx,
+            self.queue_idx,
+            header,
+            self.inner.clone(),
+        ))
+    }
+
+    /// Whether there is a used element that can pop.
+    pub fn can_pop(&self) -> bool {
+        self.inner.lock().can_pop()
+    }
+
+    /// The number of free descriptors.
+    pub fn available_desc(&self) -> usize {
+        self.inner.lock().available_desc::<QUEUE_SIZE>()
+    }
+
+    /// Get a token from device used buffers, return (token, len).
+    ///
+    /// Ref: linux virtio_ring.c virtqueue_get_buf_ctx
+    pub fn pop_used(&self) -> Option<(u16, u32)> {
+        self.inner.lock().pop_used::<QUEUE_SIZE>()
+    }
+
+    /// Handle interrupt, waker.wake() will be called in this function.
+    pub fn handle_interrupt(&self) -> core::result::Result<(), HandleIntrError> {
+        self.inner.lock().handle_interrupt::<QUEUE_SIZE>()
+    }
+}
+
+struct VirtQueueInner<'a> {
+    /// Descriptor table
+    desc: &'a mut [Descriptor],
+    /// Available ring
+    avail: &'a mut AvailRing,
+    /// Used ring
+    used: &'a mut UsedRing,
+    /// The number of used queues.
+    num_used: u16,
+    /// The head desc index of the free list.
+    free_head: u16,
+    avail_idx: u16,
+    last_used_idx: u16,
+
+    // Can not use fixed array instead of Vec
+    // due to the const generic limitations.
+    wakers: Vec<Option<Waker>>,
+}
+
+impl VirtQueueInner<'_> {
+    fn can_pop(&self) -> bool {
+        self.last_used_idx != self.used.idx.read()
+    }
+
+    fn available_desc<const QUEUE_SIZE: usize>(&self) -> usize {
+        QUEUE_SIZE - self.num_used as usize
+    }
+
+    /// Recycle descriptors in the list specified by head.
+    ///
+    /// This will push all linked descriptors at the front of the free list.
+    fn recycle_descriptors(&mut self, mut head: u16) {
+        let origin_free_head = self.free_head;
+        self.free_head = head;
+        loop {
+            let desc = &mut self.desc[head as usize];
+            let flags = desc.flags.read();
+            self.num_used -= 1;
+            if flags.contains(DescFlags::NEXT) {
+                head = desc.next.read();
+            } else {
+                desc.next.write(origin_free_head);
+                return;
+            }
+        }
+    }
+
+    fn next_used<const QUEUE_SIZE: usize>(&self) -> Option<(u16, u32)> {
+        if !self.can_pop() {
+            return None;
+        }
+
+        // read barrier
+        fence(Ordering::SeqCst);
+
+        let last_used_slot = self.last_used_idx as usize & (QUEUE_SIZE - 1);
+        let index = self.used.ring[last_used_slot].id.read() as u16;
+        let len = self.used.ring[last_used_slot].len.read();
+
+        Some((index, len))
+    }
+
+    fn pop_used<const QUEUE_SIZE: usize>(&mut self) -> Option<(u16, u32)> {
+        if !self.can_pop() {
+            return None;
+        }
+
+        // read barrier
+        fence(Ordering::SeqCst);
+
+        let last_used_slot = self.last_used_idx as usize & (QUEUE_SIZE - 1);
+        let index = self.used.ring[last_used_slot].id.read() as u16;
+        let len = self.used.ring[last_used_slot].len.read();
+
+        self.recycle_descriptors(index);
+        self.last_used_idx = self.last_used_idx.wrapping_add(1);
+
+        Some((index, len))
+    }
+
+    fn add<const QUEUE_SIZE: usize>(
+        &mut self,
+        inputs: &[&[u8]],
+        outputs: &[&mut [u8]],
+    ) -> Result<u16> {
         if inputs.is_empty() && outputs.is_empty() {
             return Err(Error::InvalidParam);
         }
-        if inputs.len() + outputs.len() + self.num_used as usize > QUEUE_SIZE as usize {
+        if inputs.len() + outputs.len() + self.num_used as usize > QUEUE_SIZE {
             return Err(Error::BufferTooSmall);
         }
 
@@ -113,7 +233,7 @@ impl<const QUEUE_SIZE: u16> VirtQueue<'_, QUEUE_SIZE> {
         }
         self.num_used += (inputs.len() + outputs.len()) as u16;
 
-        let avail_slot = self.avail_idx & (QUEUE_SIZE - 1);
+        let avail_slot = self.avail_idx as usize & (QUEUE_SIZE - 1);
         self.avail.ring[avail_slot as usize].write(head);
 
         // write barrier
@@ -125,53 +245,62 @@ impl<const QUEUE_SIZE: u16> VirtQueue<'_, QUEUE_SIZE> {
         Ok(head)
     }
 
-    /// Whether there is a used element that can pop.
-    pub fn can_pop(&self) -> bool {
-        self.last_used_idx != self.used.idx.read()
+    fn handle_interrupt<const QUEUE_SIZE: usize>(
+        &self,
+    ) -> core::result::Result<(), HandleIntrError> {
+        let (index, _) = self
+            .next_used::<QUEUE_SIZE>()
+            .ok_or(HandleIntrError::QueueNotReady)?;
+        self.wakers[index as usize]
+            .as_ref()
+            .ok_or(HandleIntrError::WakerNotExist(index))?
+            .wake_by_ref();
+        Ok(())
     }
+}
 
-    /// The number of free descriptors.
-    pub fn available_desc(&self) -> usize {
-        (QUEUE_SIZE - self.num_used) as usize
-    }
+pub struct VirtFuture<'a, const QUEUE_SIZE: usize> {
+    desc_idx: u16,
+    queue_idx: u32,
+    first_poll: Option<()>,
+    header: NonNull<VirtIOHeader>,
+    virt_queue_inner: Arc<spin::Mutex<VirtQueueInner<'a>>>,
+}
 
-    /// Recycle descriptors in the list specified by head.
-    ///
-    /// This will push all linked descriptors at the front of the free list.
-    fn recycle_descriptors(&mut self, mut head: u16) {
-        let origin_free_head = self.free_head;
-        self.free_head = head;
-        loop {
-            let desc = &mut self.desc[head as usize];
-            let flags = desc.flags.read();
-            self.num_used -= 1;
-            if flags.contains(DescFlags::NEXT) {
-                head = desc.next.read();
-            } else {
-                desc.next.write(origin_free_head);
-                return;
-            }
+impl<'a, const QUEUE_SIZE: usize> VirtFuture<'a, QUEUE_SIZE> {
+    fn new(
+        desc_idx: u16,
+        queue_idx: u32,
+        header: NonNull<VirtIOHeader>,
+        virt_queue_inner: Arc<spin::Mutex<VirtQueueInner<'a>>>,
+    ) -> Self {
+        Self {
+            desc_idx,
+            queue_idx,
+            first_poll: Some(()),
+            header,
+            virt_queue_inner,
         }
     }
+}
 
-    /// Get a token from device used buffers, return (token, len).
-    ///
-    /// Ref: linux virtio_ring.c virtqueue_get_buf_ctx
-    pub fn pop_used(&mut self) -> Result<(u16, u32)> {
-        if !self.can_pop() {
-            return Err(Error::NotReady);
+impl<const QUEUE_SIZE: usize> Future for VirtFuture<'_, QUEUE_SIZE> {
+    type Output = (u16, u32);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        if self.first_poll.take().is_some() {
+            let queue_idx = self.queue_idx;
+            unsafe { self.header.as_mut() }.notify(queue_idx);
         }
-        // read barrier
-        fence(Ordering::SeqCst);
 
-        let last_used_slot = self.last_used_idx & (QUEUE_SIZE - 1);
-        let index = self.used.ring[last_used_slot as usize].id.read() as u16;
-        let len = self.used.ring[last_used_slot as usize].len.read();
+        let mut virt_queue_inner = self.virt_queue_inner.lock();
 
-        self.recycle_descriptors(index);
-        self.last_used_idx = self.last_used_idx.wrapping_add(1);
-
-        Ok((index, len))
+        if let Some(output) = virt_queue_inner.pop_used::<QUEUE_SIZE>() {
+            Poll::Ready(output)
+        } else {
+            virt_queue_inner.wakers[self.desc_idx as usize] = Some(cx.waker().clone());
+            Poll::Pending
+        }
     }
 }
 
@@ -185,8 +314,7 @@ struct VirtQueueLayout {
 }
 
 impl VirtQueueLayout {
-    const fn new(queue_size: u16) -> Self {
-        let queue_size = queue_size as usize;
+    const fn new(queue_size: usize) -> Self {
         let desc = size_of::<Descriptor>() * queue_size;
         let avail = size_of::<u16>() * (3 + queue_size);
         let used = size_of::<u16>() * 3 + size_of::<UsedElem>() * queue_size;

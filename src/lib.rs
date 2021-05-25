@@ -7,6 +7,8 @@
 
 // #[macro_use]
 extern crate log;
+#[macro_use]
+extern crate alloc;
 
 mod blk;
 mod console;
@@ -73,6 +75,12 @@ pub trait PageSize {
     }
 }
 
+/// A standard 4KiB page.
+pub struct Size4KiB;
+impl PageSize for Size4KiB {
+    const PAGE_SIZE_SHIFT: u8 = 12;
+}
+
 /// Convert a struct into buffer.
 unsafe trait AsBuf: Sized {
     fn as_buf(&self) -> &[u8] {
@@ -80,5 +88,34 @@ unsafe trait AsBuf: Sized {
     }
     fn as_buf_mut(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self as *mut _ as _, size_of::<Self>()) }
+    }
+}
+
+/// The error type of handle_interrupt fn.
+pub enum HandleIntrError {
+    /// The device is not ready.
+    QueueNotReady,
+    /// Corresponding waker does not exist. (id)
+    WakerNotExist(u16),
+}
+
+/// Interrupt handler, Driver should implement it.
+pub trait InterruptHandler {
+    /// handler interrupt
+    fn handle_interrupt(&self) -> core::result::Result<(), HandleIntrError>;
+}
+
+/// Handle virtio interrupts.
+/// `driver_fetcher` is a function that accepts a device id.
+/// and returns the corresponding driver.
+/// Returned driver must implement the `InterruptHandler` trait.
+/// `handle_interrupt_fn` returns a function for handling virtio device interrupts.
+/// Returned function needs to pass in a device id.
+pub fn handle_interrupt_fn<'a, F: Fn(usize) -> &'a dyn InterruptHandler>(
+    driver_fetcher: F,
+) -> impl Fn(usize) -> core::result::Result<(), HandleIntrError> {
+    move |dev_id| {
+        let driver = driver_fetcher(dev_id);
+        driver.handle_interrupt()
     }
 }

@@ -9,6 +9,8 @@ extern crate log;
 // #[macro_use]
 extern crate opensbi_rt;
 
+use core::ptr::NonNull;
+
 use device_tree::util::SliceRead;
 use device_tree::{DeviceTree, Node};
 use log::LevelFilter;
@@ -57,13 +59,14 @@ fn virtio_probe(node: &Node) {
         let size = reg.as_slice().read_be_u64(8).unwrap();
         let vaddr = paddr;
         info!("walk dt addr={:#x}, size={:#x}", paddr, size);
-        let header = unsafe { &mut *(vaddr as *mut VirtIOHeader) };
+        let header = NonNull::new(vaddr as *mut VirtIOHeader).unwrap();
+        let header_ref = unsafe { header.as_ref() };
         info!(
             "Detected virtio device with vendor id {:#X}",
-            header.vendor_id()
+            header_ref.vendor_id()
         );
         info!("Device tree node {:?}", node);
-        match header.device_type() {
+        match header_ref.device_type() {
             DeviceType::Block => virtio_blk(header),
             DeviceType::GPU => virtio_gpu(header),
             DeviceType::Input => virtio_input(header),
@@ -73,8 +76,8 @@ fn virtio_probe(node: &Node) {
     }
 }
 
-fn virtio_blk(header: &'static mut VirtIOHeader) {
-    let mut blk = VirtIOBlk::new(header).expect("failed to create blk driver");
+fn virtio_blk(header: NonNull<VirtIOHeader>) {
+    let blk = VirtIOBlk::new::<Size4KiB>(header).expect("failed to create blk driver");
     let mut input = vec![0xffu8; 512];
     let mut output = vec![0; 512];
     for i in 0..32 {
@@ -88,9 +91,11 @@ fn virtio_blk(header: &'static mut VirtIOHeader) {
     info!("virtio-blk test finished");
 }
 
-fn virtio_gpu(header: &'static mut VirtIOHeader) {
-    let mut gpu = VirtIOGpu::new(header).expect("failed to create gpu driver");
-    let fb = gpu.setup_framebuffer().expect("failed to get fb");
+fn virtio_gpu(header: NonNull<VirtIOHeader>) {
+    let mut gpu = VirtIOGpu::new::<Size4KiB>(header).expect("failed to create gpu driver");
+    let fb = gpu
+        .setup_framebuffer::<Size4KiB>()
+        .expect("failed to get fb");
     for y in 0..768 {
         for x in 0..1024 {
             let idx = (y * 1024 + x) * 4;
@@ -103,10 +108,10 @@ fn virtio_gpu(header: &'static mut VirtIOHeader) {
     info!("virtio-gpu test finished");
 }
 
-fn virtio_input(header: &'static mut VirtIOHeader) {
+fn virtio_input(header: NonNull<VirtIOHeader>) {
     let mut event_buf = [0u64; 32];
-    let mut _input =
-        VirtIOInput::new(header, &mut event_buf).expect("failed to create input driver");
+    let mut _input = VirtIOInput::new::<Size4KiB>(header, &mut event_buf)
+        .expect("failed to create input driver");
     // loop {
     //     input.ack_interrupt().expect("failed to ack");
     //     info!("mouse: {:?}", input.mouse_xy());
@@ -114,8 +119,8 @@ fn virtio_input(header: &'static mut VirtIOHeader) {
     // TODO: handle external interrupt
 }
 
-fn virtio_net(header: &'static mut VirtIOHeader) {
-    let mut net = VirtIONet::new(header).expect("failed to create net driver");
+fn virtio_net(header: NonNull<VirtIOHeader>) {
+    let mut net = VirtIONet::new::<Size4KiB>(header).expect("failed to create net driver");
     let mut buf = [0u8; 0x100];
     let len = net.recv(&mut buf).expect("failed to recv");
     info!("recv: {:?}", &buf[..len]);

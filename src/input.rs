@@ -1,5 +1,6 @@
 use super::*;
 use bitflags::*;
+use core::ptr::NonNull;
 use log::*;
 use volatile::Volatile;
 
@@ -9,7 +10,7 @@ use volatile::Volatile;
 /// Device behavior mirrors that of the evdev layer in Linux,
 /// making pass-through implementations on top of evdev easy.
 pub struct VirtIOInput<'a> {
-    header: &'static mut VirtIOHeader,
+    header: NonNull<VirtIOHeader>,
     event_queue: VirtQueue<'a, QUEUE_SIZE>,
     status_queue: VirtQueue<'a, QUEUE_SIZE>,
     event_buf: &'a mut [Event],
@@ -20,14 +21,15 @@ pub struct VirtIOInput<'a> {
 impl<'a> VirtIOInput<'a> {
     /// Create a new VirtIO-Input driver.
     pub fn new<PS: PageSize>(
-        header: &'static mut VirtIOHeader,
+        mut header: NonNull<VirtIOHeader>,
         event_buf: &'a mut [u64],
     ) -> Result<Self> {
-        if event_buf.len() < QUEUE_SIZE as usize {
+        let header_mut = unsafe { header.as_mut() };
+        if event_buf.len() < QUEUE_SIZE {
             return Err(Error::BufferTooSmall);
         }
         let event_buf: &mut [Event] = unsafe { core::mem::transmute(event_buf) };
-        header.begin_init::<PS, _>(|features| {
+        header_mut.begin_init::<PS, _>(|features| {
             let features = Feature::from_bits_truncate(features);
             info!("Device features: {:?}", features);
             // negotiate these flags only
@@ -36,17 +38,17 @@ impl<'a> VirtIOInput<'a> {
         });
 
         // read configuration space
-        let config = unsafe { &mut *(header.config_space() as *mut Config) };
+        let config = unsafe { &mut *(header_mut.config_space() as *mut Config) };
         info!("Config: {:?}", config);
 
-        let mut event_queue = VirtQueue::new::<PS>(header, QUEUE_EVENT)?;
-        let status_queue = VirtQueue::new::<PS>(header, QUEUE_STATUS)?;
+        let event_queue = VirtQueue::new::<PS>(header_mut, QUEUE_EVENT)?;
+        let status_queue = VirtQueue::new::<PS>(header_mut, QUEUE_STATUS)?;
         for (i, event) in event_buf.iter_mut().enumerate() {
             let token = event_queue.add(&[], &[event.as_buf_mut()])?;
             assert_eq!(token, i as u16);
         }
 
-        header.finish_init();
+        header_mut.finish_init();
 
         Ok(VirtIOInput {
             header,
@@ -60,11 +62,11 @@ impl<'a> VirtIOInput<'a> {
 
     /// Acknowledge interrupt and process events.
     pub fn ack_interrupt(&mut self) -> Result<bool> {
-        let ack = self.header.ack_interrupt();
+        let ack = self.header_mut().ack_interrupt();
         if !ack {
             return Ok(false);
         }
-        while let Ok((token, _)) = self.event_queue.pop_used() {
+        while let Some((token, _)) = self.event_queue.pop_used() {
             let event = &mut self.event_buf[token as usize];
             match EventRepr::from(*event) {
                 EventRepr::RelX(dx) => self.x += dx,
@@ -80,6 +82,11 @@ impl<'a> VirtIOInput<'a> {
     /// Get the coordinate of mouse.
     pub fn mouse_xy(&self) -> (i32, i32) {
         (self.x, self.y)
+    }
+
+    #[inline(always)]
+    fn header_mut(&self) -> &mut VirtIOHeader {
+        unsafe { &mut *self.header.as_ptr() }
     }
 }
 
@@ -186,4 +193,4 @@ const QUEUE_EVENT: usize = 0;
 const QUEUE_STATUS: usize = 1;
 
 // a parameter that can change
-const QUEUE_SIZE: u16 = 32;
+const QUEUE_SIZE: usize = 32;

@@ -3,6 +3,7 @@ use core::mem::{size_of, MaybeUninit};
 use super::*;
 use bitflags::*;
 use core::hint::spin_loop;
+use core::ptr::NonNull;
 use log::*;
 use volatile::{ReadOnly, Volatile};
 
@@ -14,7 +15,7 @@ use volatile::{ReadOnly, Volatile};
 /// outgoing packets are enqueued into another for transmission in that order.
 /// A third command queue is used to control advanced filtering features.
 pub struct VirtIONet<'a> {
-    header: &'static mut VirtIOHeader,
+    header: NonNull<VirtIOHeader>,
     mac: EthernetAddress,
     recv_queue: VirtQueue<'a, 2>,
     send_queue: VirtQueue<'a, 2>,
@@ -22,22 +23,23 @@ pub struct VirtIONet<'a> {
 
 impl VirtIONet<'_> {
     /// Create a new VirtIO-Net driver.
-    pub fn new<PS: PageSize>(header: &'static mut VirtIOHeader) -> Result<Self> {
-        header.begin_init::<PS, _>(|features| {
+    pub fn new<PS: PageSize>(mut header: NonNull<VirtIOHeader>) -> Result<Self> {
+        let header_mut = unsafe { header.as_mut() };
+        header_mut.begin_init::<PS, _>(|features| {
             let features = Features::from_bits_truncate(features);
             info!("Device features {:?}", features);
             let supported_features = Features::MAC | Features::STATUS;
             (features & supported_features).bits()
         });
         // read configuration space
-        let config = unsafe { &mut *(header.config_space() as *mut Config) };
+        let config = unsafe { &mut *(header_mut.config_space() as *mut Config) };
         let mac = config.mac.read();
         debug!("Got MAC={:?}, status={:?}", mac, config.status.read());
 
-        let recv_queue = VirtQueue::new::<PS>(header, QUEUE_RECEIVE)?;
-        let send_queue = VirtQueue::new::<PS>(header, QUEUE_TRANSMIT)?;
+        let recv_queue = VirtQueue::new::<PS>(header_mut, QUEUE_RECEIVE)?;
+        let send_queue = VirtQueue::new::<PS>(header_mut, QUEUE_TRANSMIT)?;
 
-        header.finish_init();
+        header_mut.finish_init();
 
         Ok(VirtIONet {
             header,
@@ -49,7 +51,7 @@ impl VirtIONet<'_> {
 
     /// Acknowledge interrupt.
     pub fn ack_interrupt(&mut self) -> bool {
-        self.header.ack_interrupt()
+        self.header_mut().ack_interrupt()
     }
 
     /// Get MAC address.
@@ -72,12 +74,12 @@ impl VirtIONet<'_> {
         let mut header = MaybeUninit::<Header>::uninit();
         let header_buf = unsafe { (*header.as_mut_ptr()).as_buf_mut() };
         self.recv_queue.add(&[], &[header_buf, buf])?;
-        self.header.notify(QUEUE_RECEIVE as u32);
+        self.header_mut().notify(QUEUE_RECEIVE as u32);
         while !self.recv_queue.can_pop() {
             spin_loop();
         }
 
-        let (_, len) = self.recv_queue.pop_used()?;
+        let (_, len) = self.recv_queue.pop_used().ok_or(Error::NotReady)?;
         // let header = unsafe { header.assume_init() };
         Ok(len as usize - size_of::<Header>())
     }
@@ -86,12 +88,17 @@ impl VirtIONet<'_> {
     pub fn send(&mut self, buf: &[u8]) -> Result {
         let header = unsafe { MaybeUninit::<Header>::zeroed().assume_init() };
         self.send_queue.add(&[header.as_buf(), buf], &[])?;
-        self.header.notify(QUEUE_TRANSMIT as u32);
+        self.header_mut().notify(QUEUE_TRANSMIT as u32);
         while !self.send_queue.can_pop() {
             spin_loop();
         }
-        self.send_queue.pop_used()?;
+        self.send_queue.pop_used().ok_or(Error::NotReady)?;
         Ok(())
+    }
+
+    #[inline(always)]
+    fn header_mut(&self) -> &mut VirtIOHeader {
+        unsafe { &mut *self.header.as_ptr() }
     }
 }
 

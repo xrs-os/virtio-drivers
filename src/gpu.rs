@@ -2,6 +2,7 @@ use super::*;
 use crate::queue::VirtQueue;
 use bitflags::*;
 use core::hint::spin_loop;
+use core::ptr::NonNull;
 use log::*;
 use volatile::{ReadOnly, Volatile, WriteOnly};
 
@@ -13,7 +14,7 @@ use volatile::{ReadOnly, Volatile, WriteOnly};
 /// In 2D mode the virtio-gpu device provides support for ARGB Hardware cursors
 /// and multiple scanouts (aka heads).
 pub struct VirtIOGpu<'a> {
-    header: &'static mut VirtIOHeader,
+    header: NonNull<VirtIOHeader>,
     rect: Rect,
     /// DMA area of frame buffer.
     frame_buffer_dma: Option<DMA>,
@@ -31,8 +32,9 @@ pub struct VirtIOGpu<'a> {
 
 impl VirtIOGpu<'_> {
     /// Create a new VirtIO-Gpu driver.
-    pub fn new<PS: PageSize>(header: &'static mut VirtIOHeader) -> Result<Self> {
-        header.begin_init::<PS, _>(|features| {
+    pub fn new<PS: PageSize>(mut header: NonNull<VirtIOHeader>) -> Result<Self> {
+        let header_mut = unsafe { header.as_mut() };
+        header_mut.begin_init::<PS, _>(|features| {
             let features = Features::from_bits_truncate(features);
             info!("Device features {:?}", features);
             let supported_features = Features::empty();
@@ -40,17 +42,17 @@ impl VirtIOGpu<'_> {
         });
 
         // read configuration space
-        let config = unsafe { &mut *(header.config_space() as *mut Config) };
+        let config = unsafe { &mut *(header_mut.config_space() as *mut Config) };
         info!("Config: {:?}", config);
 
-        let control_queue = VirtQueue::new::<PS>(header, QUEUE_TRANSMIT)?;
-        let cursor_queue = VirtQueue::new::<PS>(header, QUEUE_CURSOR)?;
+        let control_queue = VirtQueue::new::<PS>(header_mut, QUEUE_TRANSMIT)?;
+        let cursor_queue = VirtQueue::new::<PS>(header_mut, QUEUE_CURSOR)?;
 
         let queue_buf_dma = DMA::new(2)?;
         let queue_buf_send = unsafe { &mut queue_buf_dma.as_buf::<PS>()[..PS::page_size()] };
         let queue_buf_recv = unsafe { &mut queue_buf_dma.as_buf::<PS>()[PS::page_size()..] };
 
-        header.finish_init();
+        header_mut.finish_init();
 
         Ok(VirtIOGpu {
             header,
@@ -66,7 +68,7 @@ impl VirtIOGpu<'_> {
 
     /// Acknowledge interrupt.
     pub fn ack_interrupt(&mut self) -> bool {
-        self.header.ack_interrupt()
+        self.header_mut().ack_interrupt()
     }
 
     /// Get the resolution (width, height).
@@ -153,12 +155,17 @@ impl VirtIOGpu<'_> {
         }
         self.control_queue
             .add(&[self.queue_buf_send], &[self.queue_buf_recv])?;
-        self.header.notify(QUEUE_TRANSMIT as u32);
+        self.header_mut().notify(QUEUE_TRANSMIT as u32);
         while !self.control_queue.can_pop() {
             spin_loop();
         }
-        self.control_queue.pop_used()?;
+        self.control_queue.pop_used().ok_or(Error::NotReady)?;
         Ok(unsafe { (self.queue_buf_recv.as_ptr() as *const Rsp).read() })
+    }
+
+    #[inline(always)]
+    fn header_mut(&self) -> &mut VirtIOHeader {
+        unsafe { &mut *self.header.as_ptr() }
     }
 }
 

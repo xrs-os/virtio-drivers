@@ -3,6 +3,7 @@ use crate::header::VirtIOHeader;
 use crate::queue::VirtQueue;
 use bitflags::*;
 use core::hint::spin_loop;
+use core::ptr::NonNull;
 use log::*;
 use volatile::Volatile;
 
@@ -11,15 +12,16 @@ use volatile::Volatile;
 /// Read and write requests (and other exotic requests) are placed in the queue,
 /// and serviced (probably out of order) by the device except where noted.
 pub struct VirtIOBlk<'a> {
-    header: &'static mut VirtIOHeader,
+    header: NonNull<VirtIOHeader>,
     queue: VirtQueue<'a, 16>,
     capacity: usize,
 }
 
 impl VirtIOBlk<'_> {
     /// Create a new VirtIO-Blk driver.
-    pub fn new<PS: PageSize>(header: &'static mut VirtIOHeader) -> Result<Self> {
-        header.begin_init::<PS, _>(|features| {
+    pub fn new<PS: PageSize>(mut header: NonNull<VirtIOHeader>) -> Result<Self> {
+        let header_mut = unsafe { header.as_mut() };
+        header_mut.begin_init::<PS, _>(|features| {
             let features = BlkFeature::from_bits_truncate(features);
             info!("device features: {:?}", features);
             // negotiate these flags only
@@ -28,15 +30,15 @@ impl VirtIOBlk<'_> {
         });
 
         // read configuration space
-        let config = unsafe { &mut *(header.config_space() as *mut BlkConfig) };
+        let config = unsafe { &mut *(header_mut.config_space() as *mut BlkConfig) };
         info!("config: {:?}", config);
         info!(
             "found a block device of size {}KB",
             config.capacity.read() / 2
         );
 
-        let queue = VirtQueue::new::<PS>(header, 0)?;
-        header.finish_init();
+        header_mut.finish_init();
+        let queue = VirtQueue::new::<PS>(header_mut, 0)?;
 
         Ok(VirtIOBlk {
             header,
@@ -47,11 +49,11 @@ impl VirtIOBlk<'_> {
 
     /// Acknowledge interrupt.
     pub fn ack_interrupt(&mut self) -> bool {
-        self.header.ack_interrupt()
+        self.header_mut().ack_interrupt()
     }
 
     /// Read a block.
-    pub fn read_block(&mut self, block_id: usize, buf: &mut [u8]) -> Result {
+    pub fn read_block(&self, block_id: usize, buf: &mut [u8]) -> Result {
         assert_eq!(buf.len(), BLK_SIZE);
         let req = BlkReq {
             type_: ReqType::In,
@@ -60,19 +62,34 @@ impl VirtIOBlk<'_> {
         };
         let mut resp = BlkResp::default();
         self.queue.add(&[req.as_buf()], &[buf, resp.as_buf_mut()])?;
-        self.header.notify(0);
+        self.header_mut().notify(0);
         while !self.queue.can_pop() {
             spin_loop();
         }
-        self.queue.pop_used()?;
+        self.queue.pop_used().ok_or(Error::NotReady)?;
         match resp.status {
             RespStatus::Ok => Ok(()),
             _ => Err(Error::IoError),
         }
     }
 
+    /// Async read a block.
+    pub async fn async_read_block(&self, block_id: usize, buf: &mut [u8]) -> Result {
+        assert_eq!(buf.len(), BLK_SIZE);
+        let req = BlkReq {
+            type_: ReqType::In,
+            reserved: 0,
+            sector: block_id as u64,
+        };
+        let mut resp = BlkResp::default();
+        self.queue
+            .async_add(self.header, &[req.as_buf()], &[buf, resp.as_buf_mut()])?
+            .await;
+        Ok(())
+    }
+
     /// Write a block.
-    pub fn write_block(&mut self, block_id: usize, buf: &[u8]) -> Result {
+    pub fn write_block(&self, block_id: usize, buf: &[u8]) -> Result {
         assert_eq!(buf.len(), BLK_SIZE);
         let req = BlkReq {
             type_: ReqType::Out,
@@ -81,15 +98,41 @@ impl VirtIOBlk<'_> {
         };
         let mut resp = BlkResp::default();
         self.queue.add(&[req.as_buf(), buf], &[resp.as_buf_mut()])?;
-        self.header.notify(0);
+        self.header_mut().notify(0);
         while !self.queue.can_pop() {
             spin_loop();
         }
-        self.queue.pop_used()?;
+        self.queue.pop_used().ok_or(Error::NotReady)?;
         match resp.status {
             RespStatus::Ok => Ok(()),
             _ => Err(Error::IoError),
         }
+    }
+
+    /// Async write a block.
+    pub async fn async_write_block(&self, block_id: usize, buf: &[u8]) -> Result {
+        assert_eq!(buf.len(), BLK_SIZE);
+        let req = BlkReq {
+            type_: ReqType::Out,
+            reserved: 0,
+            sector: block_id as u64,
+        };
+        let mut resp = BlkResp::default();
+        self.queue
+            .async_add(self.header, &[req.as_buf(), buf], &[resp.as_buf_mut()])?
+            .await;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn header_mut(&self) -> &mut VirtIOHeader {
+        unsafe { &mut *self.header.as_ptr() }
+    }
+}
+
+impl InterruptHandler for VirtIOBlk<'_> {
+    fn handle_interrupt(&self) -> core::result::Result<(), HandleIntrError> {
+        self.queue.handle_interrupt()
     }
 }
 

@@ -1,6 +1,7 @@
 use super::*;
 use crate::queue::VirtQueue;
 use bitflags::*;
+use core::ptr::NonNull;
 use core::sync::atomic::spin_loop_hint;
 use log::*;
 use volatile::{ReadOnly, WriteOnly};
@@ -11,7 +12,7 @@ const QUEUE_TRANSMITQ_PORT_0: usize = 1;
 /// Virtio console. Only one single port is allowed since ``alloc'' is disabled.
 /// Emergency and cols/rows unimplemented.
 pub struct VirtIOConsole<'a> {
-    header: &'static mut VirtIOHeader,
+    header: NonNull<VirtIOHeader>,
     receiveq: VirtQueue<'a, 2>,
     transmitq: VirtQueue<'a, 2>,
     queue_buf_dma: DMA,
@@ -20,22 +21,23 @@ pub struct VirtIOConsole<'a> {
     pending_len: usize,
 }
 
-impl<'a> VirtIOConsole<'a> {
+impl VirtIOConsole<'_> {
     /// Create a new VirtIO-Console driver.
-    pub fn new<PS: PageSize>(header: &'static mut VirtIOHeader) -> Result<Self> {
-        header.begin_init::<PS, _>(|features| {
+    pub fn new<PS: PageSize>(mut header: NonNull<VirtIOHeader>) -> Result<Self> {
+        let header_mut = unsafe { header.as_mut() };
+        header_mut.begin_init::<PS, _>(|features| {
             let features = Features::from_bits_truncate(features);
             info!("Device features {:?}", features);
             let supported_features = Features::empty();
             (features & supported_features).bits()
         });
-        let config = unsafe { &mut *(header.config_space() as *mut Config) };
+        let config = unsafe { &mut *(header_mut.config_space() as *mut Config) };
         info!("Config: {:?}", config);
-        let receiveq = VirtQueue::new::<PS>(header, QUEUE_RECEIVEQ_PORT_0)?;
-        let transmitq = VirtQueue::new::<PS>(header, QUEUE_TRANSMITQ_PORT_0)?;
+        let receiveq = VirtQueue::new::<PS>(header_mut, QUEUE_RECEIVEQ_PORT_0)?;
+        let transmitq = VirtQueue::new::<PS>(header_mut, QUEUE_TRANSMITQ_PORT_0)?;
         let queue_buf_dma = DMA::new(1)?;
         let queue_buf_rx = unsafe { &mut queue_buf_dma.as_buf::<PS>()[0..] };
-        header.finish_init();
+        header_mut.finish_init();
         let mut console = VirtIOConsole {
             header,
             receiveq,
@@ -54,12 +56,12 @@ impl<'a> VirtIOConsole<'a> {
     }
     /// Acknowledge interrupt.
     pub fn ack_interrupt(&mut self) -> Result<bool> {
-        let ack = self.header.ack_interrupt();
+        let ack = self.header_mut().ack_interrupt();
         if !ack {
             return Ok(false);
         }
         let mut flag = false;
-        while let Ok((_token, len)) = self.receiveq.pop_used() {
+        while let Some((_token, len)) = self.receiveq.pop_used() {
             assert_eq!(flag, false);
             flag = true;
             assert_ne!(len, 0);
@@ -87,12 +89,17 @@ impl<'a> VirtIOConsole<'a> {
     pub fn send(&mut self, chr: u8) -> Result<()> {
         let buf: [u8; 1] = [chr];
         self.transmitq.add(&[&buf], &[])?;
-        self.header.notify(QUEUE_TRANSMITQ_PORT_0 as u32);
+        self.header_mut().notify(QUEUE_TRANSMITQ_PORT_0 as u32);
         while !self.transmitq.can_pop() {
             spin_loop_hint();
         }
-        self.transmitq.pop_used()?;
+        self.transmitq.pop_used().ok_or(Error::NotReady)?;
         Ok(())
+    }
+
+    #[inline(always)]
+    fn header_mut(&self) -> &mut VirtIOHeader {
+        unsafe { &mut *self.header.as_ptr() }
     }
 }
 
