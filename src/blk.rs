@@ -176,7 +176,10 @@ macro_rules! impl_blk_future {
                     let virt_fut = match this.virt_fut.as_mut().as_pin_mut() {
                         Some(virt_fut) => {
                             ready!(virt_fut.poll(cx));
-                            return Poll::Ready(Ok(()));
+                            return Poll::Ready(match this.resp.status {
+                                RespStatus::Ok => Ok(()),
+                                _ => Err(Error::IoError),
+                            });
                         }
                         None => match this.blk.queue.async_add(
                             this.blk.header,

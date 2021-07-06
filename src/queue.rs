@@ -34,7 +34,7 @@ impl<'a, const QUEUE_SIZE: usize> VirtQueue<'a, QUEUE_SIZE> {
         if !QUEUE_SIZE.is_power_of_two() || header.max_queue_size() < QUEUE_SIZE as u32 {
             return Err(Error::InvalidParam);
         }
-        let layout = VirtQueueLayout::new(QUEUE_SIZE);
+        let layout = VirtQueueLayout::new::<PS>(QUEUE_SIZE);
         // alloc continuous pages
         let dma = DMA::new(layout.size / PS::page_size())?;
 
@@ -314,14 +314,14 @@ struct VirtQueueLayout {
 }
 
 impl VirtQueueLayout {
-    const fn new(queue_size: usize) -> Self {
+    fn new<PS: PageSize>(queue_size: usize) -> Self {
         let desc = size_of::<Descriptor>() * queue_size;
         let avail = size_of::<u16>() * (3 + queue_size);
         let used = size_of::<u16>() * 3 + size_of::<UsedElem>() * queue_size;
         VirtQueueLayout {
             avail_offset: desc,
-            used_offset: align_up(desc + avail, 1 << queue_size),
-            size: align_up(desc + avail, 1 << queue_size) + align_up(used, 1 << queue_size),
+            used_offset: align_up(desc + avail, PS::page_size()),
+            size: align_up(desc + avail, PS::page_size()) + align_up(used, PS::page_size()),
         }
     }
 }
