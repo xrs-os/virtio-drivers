@@ -20,6 +20,7 @@ const QUEUE_SIZE: usize = 16;
 pub struct VirtIOBlk<'a> {
     header: NonNull<VirtIOHeader>,
     queue: VirtQueue<'a, { QUEUE_SIZE }>,
+    blk_size: u32,
     capacity: usize,
 }
 
@@ -49,6 +50,7 @@ impl VirtIOBlk<'_> {
         Ok(VirtIOBlk {
             header,
             queue,
+            blk_size: config.blk_size.read(),
             capacity: config.capacity.read() as usize,
         })
     }
@@ -60,7 +62,7 @@ impl VirtIOBlk<'_> {
 
     /// Read a block.
     pub fn read_block(&self, block_id: usize, buf: &mut [u8]) -> Result {
-        assert_eq!(buf.len(), BLK_SIZE);
+        assert_eq!(buf.len(), self.blk_size as usize);
         let req = BlkReq {
             type_: ReqType::In,
             reserved: 0,
@@ -81,7 +83,7 @@ impl VirtIOBlk<'_> {
 
     /// Write a block.
     pub fn write_block(&self, block_id: usize, buf: &[u8]) -> Result {
-        assert_eq!(buf.len(), BLK_SIZE);
+        assert_eq!(buf.len(), self.blk_size as usize);
         let req = BlkReq {
             type_: ReqType::Out,
             reserved: 0,
@@ -109,7 +111,7 @@ impl VirtIOBlk<'_> {
 impl<'a> VirtIOBlk<'a> {
     /// Async read a block.
     pub fn async_read_block(&'a self, block_id: usize, buf: &'a mut [u8]) -> BlkReadFut<'a> {
-        assert_eq!(buf.len(), BLK_SIZE);
+        assert_eq!(buf.len(), self.blk_size as usize);
         let req = BlkReq {
             type_: ReqType::In,
             reserved: 0,
@@ -127,7 +129,7 @@ impl<'a> VirtIOBlk<'a> {
 
     /// Async write a block.
     pub fn async_write_block(&'a self, block_id: usize, buf: &'a [u8]) -> BlkWriteFut<'a> {
-        assert_eq!(buf.len(), BLK_SIZE);
+        assert_eq!(buf.len(), self.blk_size as usize);
         let req = BlkReq {
             type_: ReqType::Out,
             reserved: 0,
@@ -266,8 +268,6 @@ impl Default for BlkResp {
         }
     }
 }
-
-const BLK_SIZE: usize = 512;
 
 bitflags! {
     struct BlkFeature: u64 {
