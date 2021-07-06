@@ -1,11 +1,17 @@
 use super::*;
 use crate::header::VirtIOHeader;
-use crate::queue::VirtQueue;
+use crate::queue::{VirtFuture, VirtQueue};
 use bitflags::*;
+use core::future::Future;
 use core::hint::spin_loop;
+use core::pin::Pin;
 use core::ptr::NonNull;
+use core::task::{ready, Context, Poll};
 use log::*;
+use pin_project::pin_project;
 use volatile::Volatile;
+
+const QUEUE_SIZE: usize = 16;
 
 /// The virtio block device is a simple virtual block device (ie. disk).
 ///
@@ -13,7 +19,7 @@ use volatile::Volatile;
 /// and serviced (probably out of order) by the device except where noted.
 pub struct VirtIOBlk<'a> {
     header: NonNull<VirtIOHeader>,
-    queue: VirtQueue<'a, 16>,
+    queue: VirtQueue<'a, { QUEUE_SIZE }>,
     capacity: usize,
 }
 
@@ -73,21 +79,6 @@ impl VirtIOBlk<'_> {
         }
     }
 
-    /// Async read a block.
-    pub async fn async_read_block(&self, block_id: usize, buf: &mut [u8]) -> Result {
-        assert_eq!(buf.len(), BLK_SIZE);
-        let req = BlkReq {
-            type_: ReqType::In,
-            reserved: 0,
-            sector: block_id as u64,
-        };
-        let mut resp = BlkResp::default();
-        self.queue
-            .async_add(self.header, &[req.as_buf()], &[buf, resp.as_buf_mut()])?
-            .await;
-        Ok(())
-    }
-
     /// Write a block.
     pub fn write_block(&self, block_id: usize, buf: &[u8]) -> Result {
         assert_eq!(buf.len(), BLK_SIZE);
@@ -109,26 +100,102 @@ impl VirtIOBlk<'_> {
         }
     }
 
+    #[inline(always)]
+    fn header_mut(&self) -> &mut VirtIOHeader {
+        unsafe { &mut *self.header.as_ptr() }
+    }
+}
+
+impl<'a> VirtIOBlk<'a> {
+    /// Async read a block.
+    pub fn async_read_block(&'a self, block_id: usize, buf: &'a mut [u8]) -> BlkReadFut<'a> {
+        assert_eq!(buf.len(), BLK_SIZE);
+        let req = BlkReq {
+            type_: ReqType::In,
+            reserved: 0,
+            sector: block_id as u64,
+        };
+        let resp = BlkResp::default();
+        BlkReadFut {
+            req,
+            resp,
+            blk: self,
+            buf,
+            virt_fut: None,
+        }
+    }
+
     /// Async write a block.
-    pub async fn async_write_block(&self, block_id: usize, buf: &[u8]) -> Result {
+    pub fn async_write_block(&'a self, block_id: usize, buf: &'a [u8]) -> BlkWriteFut<'a> {
         assert_eq!(buf.len(), BLK_SIZE);
         let req = BlkReq {
             type_: ReqType::Out,
             reserved: 0,
             sector: block_id as u64,
         };
-        let mut resp = BlkResp::default();
-        self.queue
-            .async_add(self.header, &[req.as_buf(), buf], &[resp.as_buf_mut()])?
-            .await;
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn header_mut(&self) -> &mut VirtIOHeader {
-        unsafe { &mut *self.header.as_ptr() }
+        let resp = BlkResp::default();
+        BlkWriteFut {
+            req,
+            resp,
+            blk: self,
+            buf,
+            virt_fut: None,
+        }
     }
 }
+
+#[pin_project]
+pub struct BlkReadFut<'a> {
+    req: BlkReq,
+    resp: BlkResp,
+    blk: &'a VirtIOBlk<'a>,
+    buf: &'a mut [u8],
+    #[pin]
+    virt_fut: Option<VirtFuture<'a, { QUEUE_SIZE }>>,
+}
+
+#[pin_project]
+pub struct BlkWriteFut<'a> {
+    req: BlkReq,
+    resp: BlkResp,
+    blk: &'a VirtIOBlk<'a>,
+    buf: &'a [u8],
+    #[pin]
+    virt_fut: Option<VirtFuture<'a, { QUEUE_SIZE }>>,
+}
+
+macro_rules! impl_blk_future {
+    ($name:ident) => {
+        impl<'a> Future for $name<'a> {
+            type Output = Result;
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let mut this = self.project();
+
+                loop {
+                    let virt_fut = match this.virt_fut.as_mut().as_pin_mut() {
+                        Some(virt_fut) => {
+                            ready!(virt_fut.poll(cx));
+                            return Poll::Ready(Ok(()));
+                        }
+                        None => match this.blk.queue.async_add(
+                            this.blk.header,
+                            &[this.req.as_buf(), this.buf],
+                            &[this.resp.as_buf_mut()],
+                        ) {
+                            Ok(fut) => fut,
+                            Err(e) => return Poll::Ready(Err(e)),
+                        },
+                    };
+                    this.virt_fut.set(Some(virt_fut));
+                }
+            }
+        }
+    };
+}
+
+impl_blk_future!(BlkReadFut);
+impl_blk_future!(BlkWriteFut);
 
 impl InterruptHandler for VirtIOBlk<'_> {
     fn handle_interrupt(&self) -> core::result::Result<(), HandleIntrError> {
