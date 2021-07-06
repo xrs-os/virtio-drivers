@@ -144,6 +144,7 @@ impl<'a> VirtIOBlk<'a> {
     }
 }
 
+/// Future for the [`VirtIOBlk::async_read_block()`] method.
 #[pin_project]
 pub struct BlkReadFut<'a> {
     req: BlkReq,
@@ -154,6 +155,7 @@ pub struct BlkReadFut<'a> {
     virt_fut: Option<VirtFuture<'a, { QUEUE_SIZE }>>,
 }
 
+/// Future for the [`VirtIOBlk::async_write_block()`] method.
 #[pin_project]
 pub struct BlkWriteFut<'a> {
     req: BlkReq,
