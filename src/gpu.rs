@@ -2,9 +2,21 @@ use super::*;
 use crate::queue::VirtQueue;
 use bitflags::*;
 use core::hint::spin_loop;
-use core::ptr::NonNull;
+use core::mem::MaybeUninit;
+use lock_api::RawMutex;
 use log::*;
 use volatile::{ReadOnly, Volatile, WriteOnly};
+
+static mut HEADER: MaybeUninit<&mut VirtIOHeader> = MaybeUninit::uninit();
+
+/// Initialize the gpu module
+pub fn init(header: &'static mut VirtIOHeader) {
+    unsafe { HEADER = MaybeUninit::new(header) }
+}
+
+fn header() -> &'static mut VirtIOHeader {
+    unsafe { HEADER.assume_init_mut() }
+}
 
 /// A virtio based graphics adapter.
 ///
@@ -13,28 +25,26 @@ use volatile::{ReadOnly, Volatile, WriteOnly};
 /// a gpu with 3D support on the host machine.
 /// In 2D mode the virtio-gpu device provides support for ARGB Hardware cursors
 /// and multiple scanouts (aka heads).
-pub struct VirtIOGpu<'a> {
-    header: NonNull<VirtIOHeader>,
+pub struct VirtIOGpu<MutexType> {
     rect: Rect,
     /// DMA area of frame buffer.
     frame_buffer_dma: Option<DMA>,
     /// Queue for sending control commands.
-    control_queue: VirtQueue<'a, 2>,
+    control_queue: VirtQueue<MutexType, 2>,
     /// Queue for sending cursor commands.
-    cursor_queue: VirtQueue<'a, 2>,
+    cursor_queue: VirtQueue<MutexType, 2>,
     /// Queue buffer DMA
     queue_buf_dma: DMA,
     /// Send buffer for queue.
-    queue_buf_send: &'a mut [u8],
+    queue_buf_send: &'static mut [u8],
     /// Recv buffer for queue.
-    queue_buf_recv: &'a mut [u8],
+    queue_buf_recv: &'static mut [u8],
 }
 
-impl VirtIOGpu<'_> {
+impl<MutexType: RawMutex> VirtIOGpu<MutexType> {
     /// Create a new VirtIO-Gpu driver.
-    pub fn new<PS: PageSize>(mut header: NonNull<VirtIOHeader>) -> Result<Self> {
-        let header_mut = unsafe { header.as_mut() };
-        header_mut.begin_init::<PS, _>(|features| {
+    pub fn new<PS: PageSize>() -> Result<Self> {
+        header().begin_init::<PS, _>(|features| {
             let features = Features::from_bits_truncate(features);
             info!("Device features {:?}", features);
             let supported_features = Features::empty();
@@ -42,20 +52,19 @@ impl VirtIOGpu<'_> {
         });
 
         // read configuration space
-        let config = unsafe { &mut *(header_mut.config_space() as *mut Config) };
+        let config = unsafe { &mut *(header().config_space() as *mut Config) };
         info!("Config: {:?}", config);
 
-        let control_queue = VirtQueue::new::<PS>(header_mut, QUEUE_TRANSMIT)?;
-        let cursor_queue = VirtQueue::new::<PS>(header_mut, QUEUE_CURSOR)?;
+        let control_queue = VirtQueue::new::<PS>(header(), QUEUE_TRANSMIT)?;
+        let cursor_queue = VirtQueue::new::<PS>(header(), QUEUE_CURSOR)?;
 
         let queue_buf_dma = DMA::new(2)?;
         let queue_buf_send = unsafe { &mut queue_buf_dma.as_buf::<PS>()[..PS::page_size()] };
         let queue_buf_recv = unsafe { &mut queue_buf_dma.as_buf::<PS>()[PS::page_size()..] };
 
-        header_mut.finish_init();
+        header().finish_init();
 
         Ok(VirtIOGpu {
-            header,
             frame_buffer_dma: None,
             rect: Rect::default(),
             control_queue,
@@ -68,7 +77,7 @@ impl VirtIOGpu<'_> {
 
     /// Acknowledge interrupt.
     pub fn ack_interrupt(&mut self) -> bool {
-        self.header_mut().ack_interrupt()
+        header().ack_interrupt()
     }
 
     /// Get the resolution (width, height).
@@ -155,17 +164,12 @@ impl VirtIOGpu<'_> {
         }
         self.control_queue
             .add(&[self.queue_buf_send], &[self.queue_buf_recv])?;
-        self.header_mut().notify(QUEUE_TRANSMIT as u32);
+        header().notify(QUEUE_TRANSMIT as u32);
         while !self.control_queue.can_pop() {
             spin_loop();
         }
         self.control_queue.pop_used().ok_or(Error::NotReady)?;
         Ok(unsafe { (self.queue_buf_recv.as_ptr() as *const Rsp).read() })
-    }
-
-    #[inline(always)]
-    fn header_mut(&self) -> &mut VirtIOHeader {
-        unsafe { &mut *self.header.as_ptr() }
     }
 }
 

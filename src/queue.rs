@@ -2,10 +2,10 @@ use alloc::{sync::Arc, vec::Vec};
 use core::future::Future;
 use core::mem::size_of;
 use core::pin::Pin;
-use core::ptr::NonNull;
 use core::slice;
 use core::sync::atomic::{fence, Ordering};
 use core::task::{Context, Poll, Waker};
+use lock_api::{Mutex, RawMutex};
 
 use super::*;
 use crate::header::VirtIOHeader;
@@ -17,15 +17,15 @@ use volatile::Volatile;
 ///
 /// Each device can have zero or more virtqueues.
 #[repr(C)]
-pub struct VirtQueue<'a, const QUEUE_SIZE: usize> {
+pub struct VirtQueue<MutexType, const QUEUE_SIZE: usize> {
     /// DMA guard
     dma: DMA,
     /// The index of queue
     queue_idx: u32,
-    inner: Arc<spin::Mutex<VirtQueueInner<'a>>>,
+    inner: Arc<Mutex<MutexType, VirtQueueInner>>,
 }
 
-impl<'a, const QUEUE_SIZE: usize> VirtQueue<'a, QUEUE_SIZE> {
+impl<MutexType: RawMutex, const QUEUE_SIZE: usize> VirtQueue<MutexType, QUEUE_SIZE> {
     /// Create a new VirtQueue.
     pub fn new<PS: PageSize>(header: &mut VirtIOHeader, idx: usize) -> Result<Self> {
         if header.queue_used(idx as u32) {
@@ -57,7 +57,7 @@ impl<'a, const QUEUE_SIZE: usize> VirtQueue<'a, QUEUE_SIZE> {
         Ok(VirtQueue {
             dma,
             queue_idx: idx as u32,
-            inner: Arc::new(spin::Mutex::new(VirtQueueInner {
+            inner: Arc::new(Mutex::new(VirtQueueInner {
                 desc,
                 avail,
                 used,
@@ -79,15 +79,15 @@ impl<'a, const QUEUE_SIZE: usize> VirtQueue<'a, QUEUE_SIZE> {
 
     pub fn async_add(
         &self,
-        header: NonNull<VirtIOHeader>,
         inputs: &[&[u8]],
         outputs: &[&mut [u8]],
-    ) -> Result<VirtFuture<'a, QUEUE_SIZE>> {
+        notify_fn: fn(u32),
+    ) -> Result<VirtFuture<MutexType, QUEUE_SIZE>> {
         let desc_idx = self.add(inputs, outputs)?;
-        Ok(VirtFuture::<'a, QUEUE_SIZE>::new(
+        Ok(virt_future(
             desc_idx,
             self.queue_idx,
-            header,
+            notify_fn,
             self.inner.clone(),
         ))
     }
@@ -115,13 +115,13 @@ impl<'a, const QUEUE_SIZE: usize> VirtQueue<'a, QUEUE_SIZE> {
     }
 }
 
-struct VirtQueueInner<'a> {
+struct VirtQueueInner {
     /// Descriptor table
-    desc: &'a mut [Descriptor],
+    desc: &'static mut [Descriptor],
     /// Available ring
-    avail: &'a mut AvailRing,
+    avail: &'static mut AvailRing,
     /// Used ring
-    used: &'a mut UsedRing,
+    used: &'static mut UsedRing,
     /// The number of used queues.
     num_used: u16,
     /// The head desc index of the free list.
@@ -134,7 +134,7 @@ struct VirtQueueInner<'a> {
     wakers: Vec<Option<Waker>>,
 }
 
-impl VirtQueueInner<'_> {
+impl VirtQueueInner {
     fn can_pop(&self) -> bool {
         self.last_used_idx != self.used.idx.read()
     }
@@ -259,38 +259,35 @@ impl VirtQueueInner<'_> {
     }
 }
 
-pub struct VirtFuture<'a, const QUEUE_SIZE: usize> {
+pub struct VirtFuture<MutexType, const QUEUE_SIZE: usize> {
     desc_idx: u16,
     queue_idx: u32,
     first_poll: Option<()>,
-    header: NonNull<VirtIOHeader>,
-    virt_queue_inner: Arc<spin::Mutex<VirtQueueInner<'a>>>,
+    notify_fn: fn(u32),
+    virt_queue_inner: Arc<Mutex<MutexType, VirtQueueInner>>,
 }
 
-impl<'a, const QUEUE_SIZE: usize> VirtFuture<'a, QUEUE_SIZE> {
-    fn new(
-        desc_idx: u16,
-        queue_idx: u32,
-        header: NonNull<VirtIOHeader>,
-        virt_queue_inner: Arc<spin::Mutex<VirtQueueInner<'a>>>,
-    ) -> Self {
-        Self {
-            desc_idx,
-            queue_idx,
-            first_poll: Some(()),
-            header,
-            virt_queue_inner,
-        }
+fn virt_future<MutexType, const QUEUE_SIZE: usize>(
+    desc_idx: u16,
+    queue_idx: u32,
+    notify_fn: fn(u32),
+    virt_queue_inner: Arc<Mutex<MutexType, VirtQueueInner>>,
+) -> VirtFuture<MutexType, QUEUE_SIZE> {
+    VirtFuture {
+        desc_idx,
+        queue_idx,
+        first_poll: Some(()),
+        notify_fn,
+        virt_queue_inner,
     }
 }
 
-impl<const QUEUE_SIZE: usize> Future for VirtFuture<'_, QUEUE_SIZE> {
+impl<MutexType: RawMutex, const QUEUE_SIZE: usize> Future for VirtFuture<MutexType, QUEUE_SIZE> {
     type Output = (u16, u32);
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         if self.first_poll.take().is_some() {
-            let queue_idx = self.queue_idx;
-            unsafe { self.header.as_mut() }.notify(queue_idx);
+            (self.notify_fn)(self.queue_idx);
         }
 
         let mut virt_queue_inner = self.virt_queue_inner.lock();

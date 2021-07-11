@@ -3,9 +3,20 @@ use core::mem::{size_of, MaybeUninit};
 use super::*;
 use bitflags::*;
 use core::hint::spin_loop;
-use core::ptr::NonNull;
+use lock_api::RawMutex;
 use log::*;
 use volatile::{ReadOnly, Volatile};
+
+static mut HEADER: MaybeUninit<&mut VirtIOHeader> = MaybeUninit::uninit();
+
+/// Initialize the net module
+pub fn init(header: &'static mut VirtIOHeader) {
+    unsafe { HEADER = MaybeUninit::new(header) }
+}
+
+fn header() -> &'static mut VirtIOHeader {
+    unsafe { HEADER.assume_init_mut() }
+}
 
 /// The virtio network device is a virtual ethernet card.
 ///
@@ -14,35 +25,32 @@ use volatile::{ReadOnly, Volatile};
 /// Empty buffers are placed in one virtqueue for receiving packets, and
 /// outgoing packets are enqueued into another for transmission in that order.
 /// A third command queue is used to control advanced filtering features.
-pub struct VirtIONet<'a> {
-    header: NonNull<VirtIOHeader>,
+pub struct VirtIONet<MutexType> {
     mac: EthernetAddress,
-    recv_queue: VirtQueue<'a, 2>,
-    send_queue: VirtQueue<'a, 2>,
+    recv_queue: VirtQueue<MutexType, 2>,
+    send_queue: VirtQueue<MutexType, 2>,
 }
 
-impl VirtIONet<'_> {
+impl<MutexType: RawMutex> VirtIONet<MutexType> {
     /// Create a new VirtIO-Net driver.
-    pub fn new<PS: PageSize>(mut header: NonNull<VirtIOHeader>) -> Result<Self> {
-        let header_mut = unsafe { header.as_mut() };
-        header_mut.begin_init::<PS, _>(|features| {
+    pub fn new<PS: PageSize>() -> Result<Self> {
+        header().begin_init::<PS, _>(|features| {
             let features = Features::from_bits_truncate(features);
             info!("Device features {:?}", features);
             let supported_features = Features::MAC | Features::STATUS;
             (features & supported_features).bits()
         });
         // read configuration space
-        let config = unsafe { &mut *(header_mut.config_space() as *mut Config) };
+        let config = unsafe { &mut *(header().config_space() as *mut Config) };
         let mac = config.mac.read();
         debug!("Got MAC={:?}, status={:?}", mac, config.status.read());
 
-        let recv_queue = VirtQueue::new::<PS>(header_mut, QUEUE_RECEIVE)?;
-        let send_queue = VirtQueue::new::<PS>(header_mut, QUEUE_TRANSMIT)?;
+        let recv_queue = VirtQueue::new::<PS>(header(), QUEUE_RECEIVE)?;
+        let send_queue = VirtQueue::new::<PS>(header(), QUEUE_TRANSMIT)?;
 
-        header_mut.finish_init();
+        header().finish_init();
 
         Ok(VirtIONet {
-            header,
             mac,
             recv_queue,
             send_queue,
@@ -51,7 +59,7 @@ impl VirtIONet<'_> {
 
     /// Acknowledge interrupt.
     pub fn ack_interrupt(&mut self) -> bool {
-        self.header_mut().ack_interrupt()
+        header().ack_interrupt()
     }
 
     /// Get MAC address.
@@ -71,10 +79,12 @@ impl VirtIONet<'_> {
 
     /// Receive a packet.
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let mut header = MaybeUninit::<Header>::uninit();
-        let header_buf = unsafe { (*header.as_mut_ptr()).as_buf_mut() };
-        self.recv_queue.add(&[], &[header_buf, buf])?;
-        self.header_mut().notify(QUEUE_RECEIVE as u32);
+        {
+            let mut header = MaybeUninit::<Header>::uninit();
+            let header_buf = unsafe { (*header.as_mut_ptr()).as_buf_mut() };
+            self.recv_queue.add(&[], &[header_buf, buf])?;
+        }
+        header().notify(QUEUE_RECEIVE as u32);
         while !self.recv_queue.can_pop() {
             spin_loop();
         }
@@ -86,19 +96,17 @@ impl VirtIONet<'_> {
 
     /// Send a packet.
     pub fn send(&mut self, buf: &[u8]) -> Result {
-        let header = unsafe { MaybeUninit::<Header>::zeroed().assume_init() };
-        self.send_queue.add(&[header.as_buf(), buf], &[])?;
-        self.header_mut().notify(QUEUE_TRANSMIT as u32);
+        {
+            let header = unsafe { MaybeUninit::<Header>::zeroed().assume_init() };
+            self.send_queue.add(&[header.as_buf(), buf], &[])?;
+        }
+
+        header().notify(QUEUE_TRANSMIT as u32);
         while !self.send_queue.can_pop() {
             spin_loop();
         }
         self.send_queue.pop_used().ok_or(Error::NotReady)?;
         Ok(())
-    }
-
-    #[inline(always)]
-    fn header_mut(&self) -> &mut VirtIOHeader {
-        unsafe { &mut *self.header.as_ptr() }
     }
 }
 
