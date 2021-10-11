@@ -1,29 +1,19 @@
 use super::*;
 use crate::queue::VirtQueue;
+use alloc::sync::Arc;
 use bitflags::*;
-use core::mem::MaybeUninit;
 use core::sync::atomic::spin_loop_hint;
-use lock_api::RawMutex;
+use lock_api::{Mutex, RawMutex};
 use log::*;
 use volatile::{ReadOnly, WriteOnly};
 
 const QUEUE_RECEIVEQ_PORT_0: usize = 0;
 const QUEUE_TRANSMITQ_PORT_0: usize = 1;
 
-static mut HEADER: MaybeUninit<&mut VirtIOHeader> = MaybeUninit::uninit();
-
-/// Initialize the console module
-pub fn init(header: &'static mut VirtIOHeader) {
-    unsafe { HEADER = MaybeUninit::new(header) }
-}
-
-fn header() -> &'static mut VirtIOHeader {
-    unsafe { HEADER.assume_init_mut() }
-}
-
 /// Virtio console. Only one single port is allowed since ``alloc'' is disabled.
 /// Emergency and cols/rows unimplemented.
 pub struct VirtIOConsole<MutexType> {
+    header: Arc<Mutex<MutexType, &'static mut VirtIOHeader>>,
     receiveq: VirtQueue<MutexType, 2>,
     transmitq: VirtQueue<MutexType, 2>,
     queue_buf_dma: DMA,
@@ -34,21 +24,22 @@ pub struct VirtIOConsole<MutexType> {
 
 impl<MutexType: RawMutex> VirtIOConsole<MutexType> {
     /// Create a new VirtIO-Console driver.
-    pub fn new<PS: PageSize>() -> Result<Self> {
-        header().begin_init::<PS, _>(|features| {
+    pub fn new<PS: PageSize>(header: &'static mut VirtIOHeader) -> Result<Self> {
+        header.begin_init::<PS, _>(|features| {
             let features = Features::from_bits_truncate(features);
             info!("Device features {:?}", features);
             let supported_features = Features::empty();
             (features & supported_features).bits()
         });
-        let config = unsafe { &mut *(header().config_space() as *mut Config) };
+        let config = unsafe { &mut *(header.config_space() as *mut Config) };
         info!("Config: {:?}", config);
-        let receiveq = VirtQueue::new::<PS>(header(), QUEUE_RECEIVEQ_PORT_0)?;
-        let transmitq = VirtQueue::new::<PS>(header(), QUEUE_TRANSMITQ_PORT_0)?;
+        let receiveq = VirtQueue::new::<PS>(header, QUEUE_RECEIVEQ_PORT_0)?;
+        let transmitq = VirtQueue::new::<PS>(header, QUEUE_TRANSMITQ_PORT_0)?;
         let queue_buf_dma = DMA::new(1)?;
         let queue_buf_rx = unsafe { queue_buf_dma.as_buf::<PS>() };
-        header().finish_init();
+        header.finish_init();
         let mut console = VirtIOConsole {
+            header: Arc::new(Mutex::new(header)),
             receiveq,
             transmitq,
             queue_buf_dma,
@@ -65,7 +56,7 @@ impl<MutexType: RawMutex> VirtIOConsole<MutexType> {
     }
     /// Acknowledge interrupt.
     pub fn ack_interrupt(&mut self) -> Result<bool> {
-        let ack = header().ack_interrupt();
+        let ack = self.header.lock().ack_interrupt();
         if !ack {
             return Ok(false);
         }
@@ -95,10 +86,10 @@ impl<MutexType: RawMutex> VirtIOConsole<MutexType> {
         Ok(Some(ch))
     }
     /// Put a char onto the device.
-    pub fn send(&mut self, chr: u8) -> Result<()> {
+    pub fn send(&self, chr: u8) -> Result<()> {
         let buf: [u8; 1] = [chr];
         self.transmitq.add(&[&buf], &[])?;
-        header().notify(QUEUE_TRANSMITQ_PORT_0 as u32);
+        self.header.lock().notify(QUEUE_TRANSMITQ_PORT_0 as u32);
         while !self.transmitq.can_pop() {
             spin_loop_hint();
         }

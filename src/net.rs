@@ -1,22 +1,12 @@
 use core::mem::{size_of, MaybeUninit};
 
 use super::*;
+use alloc::sync::Arc;
 use bitflags::*;
 use core::hint::spin_loop;
-use lock_api::RawMutex;
+use lock_api::{Mutex, RawMutex};
 use log::*;
 use volatile::{ReadOnly, Volatile};
-
-static mut HEADER: MaybeUninit<&mut VirtIOHeader> = MaybeUninit::uninit();
-
-/// Initialize the net module
-pub fn init(header: &'static mut VirtIOHeader) {
-    unsafe { HEADER = MaybeUninit::new(header) }
-}
-
-fn header() -> &'static mut VirtIOHeader {
-    unsafe { HEADER.assume_init_mut() }
-}
 
 /// The virtio network device is a virtual ethernet card.
 ///
@@ -26,6 +16,7 @@ fn header() -> &'static mut VirtIOHeader {
 /// outgoing packets are enqueued into another for transmission in that order.
 /// A third command queue is used to control advanced filtering features.
 pub struct VirtIONet<MutexType> {
+    header: Arc<Mutex<MutexType, &'static mut VirtIOHeader>>,
     mac: EthernetAddress,
     recv_queue: VirtQueue<MutexType, 2>,
     send_queue: VirtQueue<MutexType, 2>,
@@ -33,24 +24,25 @@ pub struct VirtIONet<MutexType> {
 
 impl<MutexType: RawMutex> VirtIONet<MutexType> {
     /// Create a new VirtIO-Net driver.
-    pub fn new<PS: PageSize>() -> Result<Self> {
-        header().begin_init::<PS, _>(|features| {
+    pub fn new<PS: PageSize>(header: &'static mut VirtIOHeader) -> Result<Self> {
+        header.begin_init::<PS, _>(|features| {
             let features = Features::from_bits_truncate(features);
             info!("Device features {:?}", features);
             let supported_features = Features::MAC | Features::STATUS;
             (features & supported_features).bits()
         });
         // read configuration space
-        let config = unsafe { &mut *(header().config_space() as *mut Config) };
+        let config = unsafe { &mut *(header.config_space() as *mut Config) };
         let mac = config.mac.read();
         debug!("Got MAC={:?}, status={:?}", mac, config.status.read());
 
-        let recv_queue = VirtQueue::new::<PS>(header(), QUEUE_RECEIVE)?;
-        let send_queue = VirtQueue::new::<PS>(header(), QUEUE_TRANSMIT)?;
+        let recv_queue = VirtQueue::new::<PS>(header, QUEUE_RECEIVE)?;
+        let send_queue = VirtQueue::new::<PS>(header, QUEUE_TRANSMIT)?;
 
-        header().finish_init();
+        header.finish_init();
 
         Ok(VirtIONet {
+            header: Arc::new(Mutex::new(header)),
             mac,
             recv_queue,
             send_queue,
@@ -58,8 +50,8 @@ impl<MutexType: RawMutex> VirtIONet<MutexType> {
     }
 
     /// Acknowledge interrupt.
-    pub fn ack_interrupt(&mut self) -> bool {
-        header().ack_interrupt()
+    pub fn ack_interrupt(&self) -> bool {
+        self.header.lock().ack_interrupt()
     }
 
     /// Get MAC address.
@@ -84,7 +76,7 @@ impl<MutexType: RawMutex> VirtIONet<MutexType> {
             let header_buf = unsafe { (*header.as_mut_ptr()).as_buf_mut() };
             self.recv_queue.add(&[], &[header_buf, buf])?;
         }
-        header().notify(QUEUE_RECEIVE as u32);
+        self.header.lock().notify(QUEUE_RECEIVE as u32);
         while !self.recv_queue.can_pop() {
             spin_loop();
         }
@@ -101,7 +93,7 @@ impl<MutexType: RawMutex> VirtIONet<MutexType> {
             self.send_queue.add(&[header.as_buf(), buf], &[])?;
         }
 
-        header().notify(QUEUE_TRANSMIT as u32);
+        self.header.lock().notify(QUEUE_TRANSMIT as u32);
         while !self.send_queue.can_pop() {
             spin_loop();
         }

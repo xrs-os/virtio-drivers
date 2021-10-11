@@ -81,13 +81,13 @@ impl<MutexType: RawMutex, const QUEUE_SIZE: usize> VirtQueue<MutexType, QUEUE_SI
         &self,
         inputs: &[&[u8]],
         outputs: &[&mut [u8]],
-        notify_fn: fn(u32),
+        header: Arc<Mutex<MutexType, &'static mut VirtIOHeader>>,
     ) -> Result<VirtFuture<MutexType, QUEUE_SIZE>> {
         let desc_idx = self.add(inputs, outputs)?;
         Ok(virt_future(
             desc_idx,
             self.queue_idx,
-            notify_fn,
+            header,
             self.inner.clone(),
         ))
     }
@@ -263,21 +263,21 @@ pub struct VirtFuture<MutexType, const QUEUE_SIZE: usize> {
     desc_idx: u16,
     queue_idx: u32,
     first_poll: Option<()>,
-    notify_fn: fn(u32),
+    header: Arc<Mutex<MutexType, &'static mut VirtIOHeader>>,
     virt_queue_inner: Arc<Mutex<MutexType, VirtQueueInner>>,
 }
 
 fn virt_future<MutexType, const QUEUE_SIZE: usize>(
     desc_idx: u16,
     queue_idx: u32,
-    notify_fn: fn(u32),
+    header: Arc<Mutex<MutexType, &'static mut VirtIOHeader>>,
     virt_queue_inner: Arc<Mutex<MutexType, VirtQueueInner>>,
 ) -> VirtFuture<MutexType, QUEUE_SIZE> {
     VirtFuture {
         desc_idx,
         queue_idx,
         first_poll: Some(()),
-        notify_fn,
+        header,
         virt_queue_inner,
     }
 }
@@ -287,7 +287,7 @@ impl<MutexType: RawMutex, const QUEUE_SIZE: usize> Future for VirtFuture<MutexTy
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         if self.first_poll.take().is_some() {
-            (self.notify_fn)(self.queue_idx);
+            self.header.lock().notify(self.queue_idx)
         }
 
         let mut virt_queue_inner = self.virt_queue_inner.lock();

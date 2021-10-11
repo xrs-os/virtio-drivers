@@ -75,8 +75,7 @@ fn virtio_probe(node: &Node) {
 }
 
 fn virtio_blk(header: &'static mut VirtIOHeader) {
-    blk_init(header);
-    let blk = VirtIOBlk::<Mutex<()>>::new::<Size4KiB>().expect("failed to create blk driver");
+    let blk = VirtIOBlk::<Mutex<()>>::new::<Size4KiB>(header).expect("failed to create blk driver");
     let mut input = vec![0xffu8; 512];
     let mut output = vec![0; 512];
     for i in 0..32 {
@@ -91,8 +90,8 @@ fn virtio_blk(header: &'static mut VirtIOHeader) {
 }
 
 fn virtio_gpu(header: &'static mut VirtIOHeader) {
-    gpu_init(header);
-    let mut gpu = VirtIOGpu::<Mutex<()>>::new::<Size4KiB>().expect("failed to create gpu driver");
+    let mut gpu =
+        VirtIOGpu::<Mutex<()>>::new::<Size4KiB>(header).expect("failed to create gpu driver");
     let fb = gpu
         .setup_framebuffer::<Size4KiB>()
         .expect("failed to get fb");
@@ -109,9 +108,8 @@ fn virtio_gpu(header: &'static mut VirtIOHeader) {
 }
 
 fn virtio_input(header: &'static mut VirtIOHeader) {
-    input_init(header);
     let mut event_buf = [0u64; 32];
-    let mut _input = VirtIOInput::<Mutex<()>>::new::<Size4KiB>(&mut event_buf)
+    let mut _input = VirtIOInput::<Mutex<()>>::new::<Size4KiB>(header, &mut event_buf)
         .expect("failed to create input driver");
     // loop {
     //     input.ack_interrupt().expect("failed to ack");
@@ -121,8 +119,8 @@ fn virtio_input(header: &'static mut VirtIOHeader) {
 }
 
 fn virtio_net(header: &'static mut VirtIOHeader) {
-    net_init(header);
-    let mut net = VirtIONet::<Mutex<()>>::new::<Size4KiB>().expect("failed to create net driver");
+    let mut net =
+        VirtIONet::<Mutex<()>>::new::<Size4KiB>(header).expect("failed to create net driver");
     let mut buf = [0u8; 0x100];
     let len = net.recv(&mut buf).expect("failed to recv");
     info!("recv: {:?}", &buf[..len]);

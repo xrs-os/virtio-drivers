@@ -1,6 +1,4 @@
 //! VirtIO guest drivers.
-#![feature(ready_macro)]
-#![feature(maybe_uninit_ref)]
 #![no_std]
 #![deny(unused_must_use, missing_docs)]
 #![allow(clippy::identity_op)]
@@ -20,12 +18,12 @@ mod input;
 mod net;
 mod queue;
 
-pub use self::blk::{init as blk_init, BlkReadFut, BlkWriteFut, VirtIOBlk};
-pub use self::console::{init as console_init, VirtIOConsole};
-pub use self::gpu::{init as gpu_init, VirtIOGpu};
+pub use self::blk::{BlkReadFut, BlkWriteFut, VirtIOBlk};
+pub use self::console::VirtIOConsole;
+pub use self::gpu::VirtIOGpu;
 pub use self::header::*;
-pub use self::input::{init as input_init, VirtIOInput};
-pub use self::net::{init as net_init, VirtIONet};
+pub use self::input::VirtIOInput;
+pub use self::net::VirtIONet;
 use self::queue::VirtQueue;
 use core::mem::size_of;
 use hal::*;

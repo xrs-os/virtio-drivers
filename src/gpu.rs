@@ -1,22 +1,11 @@
 use super::*;
 use crate::queue::VirtQueue;
+use alloc::sync::Arc;
 use bitflags::*;
 use core::hint::spin_loop;
-use core::mem::MaybeUninit;
-use lock_api::RawMutex;
+use lock_api::{Mutex, RawMutex};
 use log::*;
 use volatile::{ReadOnly, Volatile, WriteOnly};
-
-static mut HEADER: MaybeUninit<&mut VirtIOHeader> = MaybeUninit::uninit();
-
-/// Initialize the gpu module
-pub fn init(header: &'static mut VirtIOHeader) {
-    unsafe { HEADER = MaybeUninit::new(header) }
-}
-
-fn header() -> &'static mut VirtIOHeader {
-    unsafe { HEADER.assume_init_mut() }
-}
 
 /// A virtio based graphics adapter.
 ///
@@ -26,6 +15,7 @@ fn header() -> &'static mut VirtIOHeader {
 /// In 2D mode the virtio-gpu device provides support for ARGB Hardware cursors
 /// and multiple scanouts (aka heads).
 pub struct VirtIOGpu<MutexType> {
+    header: Arc<Mutex<MutexType, &'static mut VirtIOHeader>>,
     rect: Rect,
     /// DMA area of frame buffer.
     frame_buffer_dma: Option<DMA>,
@@ -43,8 +33,8 @@ pub struct VirtIOGpu<MutexType> {
 
 impl<MutexType: RawMutex> VirtIOGpu<MutexType> {
     /// Create a new VirtIO-Gpu driver.
-    pub fn new<PS: PageSize>() -> Result<Self> {
-        header().begin_init::<PS, _>(|features| {
+    pub fn new<PS: PageSize>(header: &'static mut VirtIOHeader) -> Result<Self> {
+        header.begin_init::<PS, _>(|features| {
             let features = Features::from_bits_truncate(features);
             info!("Device features {:?}", features);
             let supported_features = Features::empty();
@@ -52,19 +42,20 @@ impl<MutexType: RawMutex> VirtIOGpu<MutexType> {
         });
 
         // read configuration space
-        let config = unsafe { &mut *(header().config_space() as *mut Config) };
+        let config = unsafe { &mut *(header.config_space() as *mut Config) };
         info!("Config: {:?}", config);
 
-        let control_queue = VirtQueue::new::<PS>(header(), QUEUE_TRANSMIT)?;
-        let cursor_queue = VirtQueue::new::<PS>(header(), QUEUE_CURSOR)?;
+        let control_queue = VirtQueue::new::<PS>(header, QUEUE_TRANSMIT)?;
+        let cursor_queue = VirtQueue::new::<PS>(header, QUEUE_CURSOR)?;
 
         let queue_buf_dma = DMA::new(2)?;
         let queue_buf_send = unsafe { &mut queue_buf_dma.as_buf::<PS>()[..PS::page_size()] };
         let queue_buf_recv = unsafe { &mut queue_buf_dma.as_buf::<PS>()[PS::page_size()..] };
 
-        header().finish_init();
+        header.finish_init();
 
         Ok(VirtIOGpu {
+            header: Arc::new(Mutex::new(header)),
             frame_buffer_dma: None,
             rect: Rect::default(),
             control_queue,
@@ -76,8 +67,8 @@ impl<MutexType: RawMutex> VirtIOGpu<MutexType> {
     }
 
     /// Acknowledge interrupt.
-    pub fn ack_interrupt(&mut self) -> bool {
-        header().ack_interrupt()
+    pub fn ack_interrupt(&self) -> bool {
+        self.header.lock().ack_interrupt()
     }
 
     /// Get the resolution (width, height).
@@ -164,7 +155,7 @@ impl<MutexType: RawMutex> VirtIOGpu<MutexType> {
         }
         self.control_queue
             .add(&[self.queue_buf_send], &[self.queue_buf_recv])?;
-        header().notify(QUEUE_TRANSMIT as u32);
+        self.header.lock().notify(QUEUE_TRANSMIT as u32);
         while !self.control_queue.can_pop() {
             spin_loop();
         }

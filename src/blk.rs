@@ -1,35 +1,25 @@
 use super::*;
 use crate::header::VirtIOHeader;
 use crate::queue::{VirtFuture, VirtQueue};
+use alloc::sync::Arc;
 use bitflags::*;
 use core::future::Future;
 use core::hint::spin_loop;
-use core::mem::MaybeUninit;
 use core::pin::Pin;
-use core::task::{ready, Context, Poll};
-use lock_api::RawMutex;
+use core::task::{Context, Poll};
+use lock_api::{Mutex, RawMutex};
 use log::*;
 use pin_project::pin_project;
 use volatile::Volatile;
 
 const QUEUE_SIZE: usize = 16;
 
-static mut HEADER: MaybeUninit<&mut VirtIOHeader> = MaybeUninit::uninit();
-
-/// Initialize the blk module
-pub fn init(header: &'static mut VirtIOHeader) {
-    unsafe { HEADER = MaybeUninit::new(header) }
-}
-
-fn header() -> &'static mut VirtIOHeader {
-    unsafe { HEADER.assume_init_mut() }
-}
-
 /// The virtio block device is a simple virtual block device (ie. disk).
 ///
 /// Read and write requests (and other exotic requests) are placed in the queue,
 /// and serviced (probably out of order) by the device except where noted.
 pub struct VirtIOBlk<MutexType> {
+    header: Arc<Mutex<MutexType, &'static mut VirtIOHeader>>,
     queue: VirtQueue<MutexType, { QUEUE_SIZE }>,
     /// Block size
     pub blk_size: u32,
@@ -39,8 +29,8 @@ pub struct VirtIOBlk<MutexType> {
 
 impl<MutexType: RawMutex> VirtIOBlk<MutexType> {
     /// Create a new VirtIO-Blk driver.
-    pub fn new<PS: PageSize>() -> Result<Self> {
-        header().begin_init::<PS, _>(|features| {
+    pub fn new<PS: PageSize>(header: &'static mut VirtIOHeader) -> Result<Self> {
+        header.begin_init::<PS, _>(|features| {
             let features = BlkFeature::from_bits_truncate(features);
             info!("device features: {:?}", features);
             // negotiate these flags only
@@ -49,17 +39,18 @@ impl<MutexType: RawMutex> VirtIOBlk<MutexType> {
         });
 
         // read configuration space
-        let config = unsafe { &mut *(header().config_space() as *mut BlkConfig) };
+        let config = unsafe { &mut *(header.config_space() as *mut BlkConfig) };
         info!("config: {:?}", config);
         info!(
             "found a block device of size {}KB",
             config.capacity.read() / 2
         );
 
-        header().finish_init();
-        let queue = VirtQueue::new::<PS>(header(), 0)?;
+        header.finish_init();
+        let queue = VirtQueue::new::<PS>(header, 0)?;
 
         Ok(VirtIOBlk {
+            header: Arc::new(Mutex::new(header)),
             queue,
             blk_size: config.blk_size.read(),
             capacity: config.capacity.read() as usize,
@@ -68,7 +59,7 @@ impl<MutexType: RawMutex> VirtIOBlk<MutexType> {
 
     /// Acknowledge interrupt.
     pub fn ack_interrupt(&self) -> bool {
-        header().ack_interrupt()
+        self.header.lock().ack_interrupt()
     }
 
     /// Read a block.
@@ -81,7 +72,7 @@ impl<MutexType: RawMutex> VirtIOBlk<MutexType> {
         };
         let mut resp = BlkResp::default();
         self.queue.add(&[req.as_buf()], &[buf, resp.as_buf_mut()])?;
-        header().notify(0);
+        self.header.lock().notify(0);
         while !self.queue.can_pop() {
             spin_loop();
         }
@@ -102,7 +93,7 @@ impl<MutexType: RawMutex> VirtIOBlk<MutexType> {
         };
         let mut resp = BlkResp::default();
         self.queue.add(&[req.as_buf(), buf], &[resp.as_buf_mut()])?;
-        header().notify(0);
+        self.header.lock().notify(0);
         while !self.queue.can_pop() {
             spin_loop();
         }
@@ -134,6 +125,7 @@ impl<MutexType> VirtIOBlk<MutexType> {
             queue: &self.queue,
             buf,
             virt_fut: None,
+            header: self.header.clone(),
         }
     }
 
@@ -156,6 +148,7 @@ impl<MutexType> VirtIOBlk<MutexType> {
             queue: &self.queue,
             buf,
             virt_fut: None,
+            header: self.header.clone(),
         }
     }
 }
@@ -169,6 +162,7 @@ pub struct BlkReadFut<'a, MutexType> {
     buf: &'a mut [u8],
     #[pin]
     virt_fut: Option<VirtFuture<MutexType, { QUEUE_SIZE }>>,
+    header: Arc<Mutex<MutexType, &'static mut VirtIOHeader>>,
 }
 
 /// Future for the [`VirtIOBlk::async_write_block()`] method.
@@ -180,6 +174,7 @@ pub struct BlkWriteFut<'a, MutexType> {
     buf: &'a [u8],
     #[pin]
     virt_fut: Option<VirtFuture<MutexType, { QUEUE_SIZE }>>,
+    header: Arc<Mutex<MutexType, &'static mut VirtIOHeader>>,
 }
 
 macro_rules! impl_blk_future {
@@ -193,7 +188,7 @@ macro_rules! impl_blk_future {
                 loop {
                     let virt_fut = match this.virt_fut.as_mut().as_pin_mut() {
                         Some(virt_fut) => {
-                            ready!(virt_fut.poll(cx));
+                            core::task::ready!(virt_fut.poll(cx));
                             return Poll::Ready(match this.resp.status {
                                 RespStatus::Ok => Ok(()),
                                 _ => Err(Error::IoError),
@@ -202,7 +197,7 @@ macro_rules! impl_blk_future {
                         None => match this.queue.async_add(
                             &[this.req.as_buf(), this.buf],
                             &[this.resp.as_buf_mut()],
-                            |queue| header().notify(queue),
+                            this.header.clone(),
                         ) {
                             Ok(fut) => fut,
                             Err(e) => return Poll::Ready(Err(e)),

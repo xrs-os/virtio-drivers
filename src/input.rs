@@ -1,20 +1,9 @@
 use super::*;
+use alloc::sync::Arc;
 use bitflags::*;
-use core::mem::MaybeUninit;
-use lock_api::RawMutex;
+use lock_api::{Mutex, RawMutex};
 use log::*;
 use volatile::Volatile;
-
-static mut HEADER: MaybeUninit<&mut VirtIOHeader> = MaybeUninit::uninit();
-
-/// Initialize the input module
-pub fn init(header: &'static mut VirtIOHeader) {
-    unsafe { HEADER = MaybeUninit::new(header) }
-}
-
-fn header() -> &'static mut VirtIOHeader {
-    unsafe { HEADER.assume_init_mut() }
-}
 
 /// Virtual human interface devices such as keyboards, mice and tablets.
 ///
@@ -22,6 +11,7 @@ fn header() -> &'static mut VirtIOHeader {
 /// Device behavior mirrors that of the evdev layer in Linux,
 /// making pass-through implementations on top of evdev easy.
 pub struct VirtIOInput<'a, MutexType> {
+    header: Arc<Mutex<MutexType, &'static mut VirtIOHeader>>,
     event_queue: VirtQueue<MutexType, QUEUE_SIZE>,
     status_queue: VirtQueue<MutexType, QUEUE_SIZE>,
     event_buf: &'a mut [Event],
@@ -31,12 +21,15 @@ pub struct VirtIOInput<'a, MutexType> {
 
 impl<'a, MutexType: RawMutex> VirtIOInput<'a, MutexType> {
     /// Create a new VirtIO-Input driver.
-    pub fn new<PS: PageSize>(event_buf: &'a mut [u64]) -> Result<Self> {
+    pub fn new<PS: PageSize>(
+        header: &'static mut VirtIOHeader,
+        event_buf: &'a mut [u64],
+    ) -> Result<Self> {
         if event_buf.len() < QUEUE_SIZE {
             return Err(Error::BufferTooSmall);
         }
         let event_buf: &mut [Event] = unsafe { core::mem::transmute(event_buf) };
-        header().begin_init::<PS, _>(|features| {
+        header.begin_init::<PS, _>(|features| {
             let features = Feature::from_bits_truncate(features);
             info!("Device features: {:?}", features);
             // negotiate these flags only
@@ -45,19 +38,20 @@ impl<'a, MutexType: RawMutex> VirtIOInput<'a, MutexType> {
         });
 
         // read configuration space
-        let config = unsafe { &mut *(header().config_space() as *mut Config) };
+        let config = unsafe { &mut *(header.config_space() as *mut Config) };
         info!("Config: {:?}", config);
 
-        let event_queue = VirtQueue::new::<PS>(header(), QUEUE_EVENT)?;
-        let status_queue = VirtQueue::new::<PS>(header(), QUEUE_STATUS)?;
+        let event_queue = VirtQueue::new::<PS>(header, QUEUE_EVENT)?;
+        let status_queue = VirtQueue::new::<PS>(header, QUEUE_STATUS)?;
         for (i, event) in event_buf.iter_mut().enumerate() {
             let token = event_queue.add(&[], &[event.as_buf_mut()])?;
             assert_eq!(token, i as u16);
         }
 
-        header().finish_init();
+        header.finish_init();
 
         Ok(VirtIOInput {
+            header: Arc::new(Mutex::new(header)),
             event_queue,
             status_queue,
             event_buf,
@@ -68,7 +62,7 @@ impl<'a, MutexType: RawMutex> VirtIOInput<'a, MutexType> {
 
     /// Acknowledge interrupt and process events.
     pub fn ack_interrupt(&mut self) -> Result<bool> {
-        let ack = header().ack_interrupt();
+        let ack = self.header.lock().ack_interrupt();
         if !ack {
             return Ok(false);
         }
