@@ -91,6 +91,7 @@ unsafe trait AsBuf: Sized {
 }
 
 /// The error type of handle_interrupt fn.
+#[derive(Debug)]
 pub enum HandleIntrError {
     /// The device is not ready.
     QueueNotReady,
