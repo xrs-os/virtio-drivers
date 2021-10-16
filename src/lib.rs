@@ -104,17 +104,3 @@ pub trait InterruptHandler {
     fn handle_interrupt(&self) -> core::result::Result<(), HandleIntrError>;
 }
 
-/// Handle virtio interrupts.
-/// `driver_fetcher` is a function that accepts a device id.
-/// and returns the corresponding driver.
-/// Returned driver must implement the `InterruptHandler` trait.
-/// `handle_interrupt_fn` returns a function for handling virtio device interrupts.
-/// Returned function needs to pass in a device id.
-pub fn handle_interrupt_fn<'a, F: Fn(usize) -> &'a dyn InterruptHandler>(
-    driver_fetcher: F,
-) -> impl Fn(usize) -> core::result::Result<(), HandleIntrError> {
-    move |dev_id| {
-        let driver = driver_fetcher(dev_id);
-        driver.handle_interrupt()
-    }
-}
