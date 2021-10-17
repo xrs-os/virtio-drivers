@@ -177,8 +177,25 @@ pub struct BlkWriteFut<'a, MutexType> {
     header: Arc<Mutex<MutexType, &'static mut VirtIOHeader>>,
 }
 
+macro_rules! queue_async_add {
+    (read => $queue:expr, $req:expr, $resp:expr, $buf:expr, $header:expr) => {
+        $queue.async_add(
+            &[$req.as_buf()],
+            &[$buf, $resp.as_buf_mut()],
+            $header.clone(),
+        )
+    };
+    (write => $queue:expr, $req:expr, $resp:expr, $buf:expr,$header:expr) => {
+        $queue.async_add(
+            &[$req.as_buf(), $buf],
+            &[$resp.as_buf_mut()],
+            $header.clone(),
+        )
+    };
+}
+
 macro_rules! impl_blk_future {
-    ($name:ident) => {
+    ($name:ident, $type:ident) => {
         impl<MutexType: RawMutex> Future for $name<'_, MutexType> {
             type Output = Result;
 
@@ -194,10 +211,13 @@ macro_rules! impl_blk_future {
                                 _ => Err(Error::IoError),
                             });
                         }
-                        None => match this.queue.async_add(
-                            &[this.req.as_buf(), this.buf],
-                            &[this.resp.as_buf_mut()],
-                            this.header.clone(),
+                        None => match queue_async_add!(
+                            $type =>
+                            this.queue,
+                            this.req,
+                            this.resp,
+                            this.buf,
+                            this.header
                         ) {
                             Ok(fut) => fut,
                             Err(e) => return Poll::Ready(Err(e)),
@@ -210,9 +230,8 @@ macro_rules! impl_blk_future {
     };
 }
 
-impl_blk_future!(BlkReadFut);
-impl_blk_future!(BlkWriteFut);
-
+impl_blk_future!(BlkReadFut, read);
+impl_blk_future!(BlkWriteFut, write);
 impl<MutexType: RawMutex> InterruptHandler for VirtIOBlk<MutexType> {
     fn handle_interrupt(&self) -> core::result::Result<(), HandleIntrError> {
         self.ack_interrupt();

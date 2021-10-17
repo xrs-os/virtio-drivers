@@ -286,16 +286,18 @@ impl<MutexType: RawMutex, const QUEUE_SIZE: usize> Future for VirtFuture<MutexTy
     type Output = (u16, u32);
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        if self.first_poll.take().is_some() {
+        let first_poll = self.first_poll.take().is_some();
+        let mut virt_queue_inner = self.virt_queue_inner.lock();
+        virt_queue_inner.wakers[self.desc_idx as usize] = Some(cx.waker().clone());
+
+        if first_poll {
             self.header.lock().notify(self.queue_idx)
         }
 
-        let mut virt_queue_inner = self.virt_queue_inner.lock();
-
         if let Some(output) = virt_queue_inner.pop_used::<QUEUE_SIZE>() {
+            virt_queue_inner.wakers[self.desc_idx as usize].take();
             Poll::Ready(output)
         } else {
-            virt_queue_inner.wakers[self.desc_idx as usize] = Some(cx.waker().clone());
             Poll::Pending
         }
     }
