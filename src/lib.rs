@@ -3,6 +3,7 @@
 #![deny(unused_must_use, missing_docs)]
 #![allow(clippy::identity_op)]
 #![allow(dead_code)]
+#![feature(ready_macro)]
 
 // #[macro_use]
 extern crate log;
@@ -104,4 +105,3 @@ pub trait InterruptHandler {
     /// handler interrupt
     fn handle_interrupt(&self) -> core::result::Result<(), HandleIntrError>;
 }
-
